@@ -3,6 +3,7 @@
 use Carbon\CarbonImmutable;
 use VitisStudio\NativeFirestore\DTO\Bytes;
 use VitisStudio\NativeFirestore\DTO\GeoPoint;
+use VitisStudio\NativeFirestore\DTO\MapValue;
 use VitisStudio\NativeFirestore\DTO\Timestamp;
 use VitisStudio\NativeFirestore\FieldValue;
 use VitisStudio\NativeFirestore\Query\DocumentReference;
@@ -161,4 +162,55 @@ it('rejects data nested deeper than Firestore allows', function () {
 
 it('rejects sentinels in query operands', function () {
     expect(fn () => ValueCodec::encodeArgument(FieldValue::serverTimestamp()))->toThrow(InvalidArgumentException::class, 'cannot be used in a query');
+});
+
+it('encodes MapValue, stdClass and empty objects as maps', function () {
+    expect(ValueCodec::json(ValueCodec::encodeMap([
+        'a' => new MapValue,
+        'b' => new MapValue(['x', 'y']),
+        'c' => (object) [],
+        'd' => [new MapValue(['k' => 1])],
+    ])))->toBe('{"a":{},"b":{"0":"x","1":"y"},"c":{},"d":[{"k":1}]}')
+        ->and(ValueCodec::json(ValueCodec::encodeArgument(new MapValue)))->toBe('{}');
+});
+
+it('decodes tagged maps to MapValue only when an array would lose them', function () {
+    expect(ValueCodec::decode(['__type' => 'map', 'value' => []]))->toEqual(new MapValue)
+        ->and(ValueCodec::decode(['__type' => 'map', 'value' => ['a']]))->toEqual(new MapValue(['a']))
+        ->and(ValueCodec::decode(['__type' => 'map', 'value' => ['k' => 1]]))->toBe(['k' => 1])
+        ->and(ValueCodec::decodeMap(['__type' => 'map', 'value' => []]))->toBe([]);
+});
+
+it('keeps JSON objects apart from arrays when reading native results', function () {
+    expect(ValueCodec::fromJson('{"a":{},"b":{"0":1},"c":[],"d":{"k":{}},"e":{"__type":"map","value":{}}}'))->toBe([
+        'a' => ['__type' => 'map', 'value' => []],
+        'b' => ['__type' => 'map', 'value' => [1]],
+        'c' => [],
+        'd' => ['k' => ['__type' => 'map', 'value' => []]],
+        'e' => ['__type' => 'map', 'value' => []],
+    ]);
+});
+
+it('turns snapshot wire values back into query arguments without losing maps', function () {
+    $data = ['m' => ['__type' => 'map', 'value' => ['k' => ['__type' => 'map', 'value' => []]]], 'at' => ['__type' => 'timestamp', 'seconds' => 1, 'nanoseconds' => 0]];
+
+    expect(ValueCodec::wireField($data, 'm.k'))->toBe([true, ['__type' => 'map', 'value' => []]])
+        ->and(ValueCodec::wireField($data, 'm.missing'))->toBe([false, null])
+        ->and(ValueCodec::wireField($data, 'at.seconds'))->toBe([false, null])
+        ->and(ValueCodec::wireField(['n' => ['__type' => 'map', 'value' => ['a', 'b']]], 'n.1'))->toBe([true, 'b'])
+        ->and(ValueCodec::wireField(['l' => ['a', 'b']], 'l.1'))->toBe([false, null])
+        ->and(ValueCodec::wireField(['0' => 'top'], '0'))->toBe([true, 'top'])
+        ->and(ValueCodec::json(ValueCodec::wireArgument($data)))->toBe('{"m":{"k":{}},"at":{"__type":"timestamp","seconds":1,"nanoseconds":0}}');
+});
+
+it('reads a MapValue like an array but refuses changes', function () {
+    $map = new MapValue(['a', 'b']);
+
+    expect($map['1'])->toBe('b')
+        ->and(isset($map['2']))->toBeFalse()
+        ->and(count($map))->toBe(2)
+        ->and(iterator_to_array($map))->toBe(['a', 'b'])
+        ->and(json_encode($map))->toBe('{"0":"a","1":"b"}')
+        ->and((new MapValue)->isEmpty())->toBeTrue()
+        ->and(fn () => $map['2'] = 'c')->toThrow(LogicException::class);
 });

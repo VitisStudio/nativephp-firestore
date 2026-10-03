@@ -4,6 +4,7 @@ use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Event;
 use VitisStudio\NativeFirestore\DTO\DocumentChange;
 use VitisStudio\NativeFirestore\DTO\GeoPoint;
+use VitisStudio\NativeFirestore\DTO\MapValue;
 use VitisStudio\NativeFirestore\DTO\Timestamp;
 use VitisStudio\NativeFirestore\Events\DocumentChanged;
 use VitisStudio\NativeFirestore\Events\QuerySnapshotChanged;
@@ -17,6 +18,7 @@ use VitisStudio\NativeFirestore\Query\Filter;
 use VitisStudio\NativeFirestore\Query\Source;
 use VitisStudio\NativeFirestore\Query\Transaction;
 use VitisStudio\NativeFirestore\Query\WriteBatch;
+use VitisStudio\NativeFirestore\Support\ValueCodec;
 
 beforeEach(function () {
     $this->fake = Firestore::fake();
@@ -300,9 +302,74 @@ describe('queries', function () {
             ->and($ids($shapes->whereArrayContainsAny('items', [new stdClass, 2])->get()))->toBe(['holder'])
             ->and(fn () => $shapes->whereArrayContainsAny('items', [[], 2])->get())->toThrow(InvalidArgumentException::class);
 
-        // Snapshots come back the way the device bridge returns them.
-        expect(Firestore::doc('shapes/map')->get()->data())->toBe(['x' => []])
-            ->and(Firestore::doc('shapes/numericMap')->get()->data())->toBe(['x' => ['a']]);
+        // Maps an array would mistake for lists come back as MapValue; lists stay lists.
+        $map = Firestore::doc('shapes/map')->get()->get('x');
+        $numericMap = Firestore::doc('shapes/numericMap')->get()->get('x');
+
+        expect($map)->toBeInstanceOf(MapValue::class)
+            ->and($map->toArray())->toBe([])
+            ->and($numericMap)->toBeInstanceOf(MapValue::class)
+            ->and($numericMap->toArray())->toBe(['a'])
+            ->and($numericMap['0'])->toBe('a')
+            ->and(Firestore::doc('shapes/numericMap')->get()->get('x.0'))->toBe('a')
+            ->and(Firestore::doc('shapes/list')->get()->data())->toBe(['x' => []])
+            ->and(Firestore::doc('shapes/list1')->get()->data())->toBe(['x' => ['a']]);
+    });
+
+    it('round-trips empty and list-like maps through read, write back and read', function () {
+        $original = [
+            'empty' => new stdClass,
+            'numeric' => (object) ['0' => 'a', '1' => 'b'],
+            'list' => ['a', 'b'],
+            'emptyList' => [],
+            'plain' => ['k' => 1, 'nested' => new stdClass],
+            'inList' => [new stdClass, (object) ['0' => 1]],
+        ];
+        Firestore::doc('shapes/source')->set($original);
+
+        $read = Firestore::doc('shapes/source')->get()->data();
+        Firestore::doc('shapes/copy')->set($read);
+        $reread = Firestore::doc('shapes/copy')->get()->data();
+
+        expect($reread)->toEqual($read)
+            ->and($reread['empty'])->toBeInstanceOf(MapValue::class)
+            ->and($reread['numeric'])->toBeInstanceOf(MapValue::class)
+            ->and($reread['numeric']->toArray())->toBe(['a', 'b'])
+            ->and($reread['list'])->toBe(['a', 'b'])
+            ->and($reread['emptyList'])->toBe([])
+            ->and($reread['plain']['k'])->toBe(1)
+            ->and($reread['plain']['nested'])->toBeInstanceOf(MapValue::class)
+            ->and($reread['inList'][0])->toBeInstanceOf(MapValue::class)
+            ->and($reread['inList'][1]->toArray())->toBe([1])
+            ->and($this->fake->commits()[1][0]['data'])->toBe($this->fake->commits()[0][0]['data']);
+
+        // Both documents are equal to the original in Firestore's eyes.
+        $equal = Firestore::collection('shapes')->where('empty', '==', new MapValue)->where('numeric', '==', (object) ['0' => 'a', '1' => 'b'])->get();
+        expect(array_map(fn ($document) => $document->id(), $equal->documents()))->toBe(['copy', 'source']);
+    });
+
+    it('pages past a cursor document whose ordered field is an empty or list-like map', function () use ($ids) {
+        Firestore::doc('maps/a')->set(['x' => []]);
+        Firestore::doc('maps/b')->set(['x' => new stdClass]);
+        Firestore::doc('maps/c')->set(['x' => (object) ['0' => 'a']]);
+        Firestore::doc('maps/d')->set(['x' => ['k' => 1]]);
+
+        $query = Firestore::collection('maps')->orderBy('x');
+        [$a, $b, $c] = $query->get()->documents();
+
+        expect($ids($query->get()))->toBe(['a', 'b', 'c', 'd'])
+            ->and($ids($query->startAfter($b)->get()))->toBe(['c', 'd'])
+            ->and($ids($query->startAt($b)->get()))->toBe(['b', 'c', 'd'])
+            ->and($ids($query->startAfter($c)->get()))->toBe(['d'])
+            ->and($ids($query->startAfter($a)->get()))->toBe(['b', 'c', 'd'])
+            ->and($ids($query->endBefore($c)->get()))->toBe(['a', 'b']);
+
+        $nested = Firestore::collection('maps')->orderBy('x.0');
+        expect($ids($nested->get()))->toBe(['c'])
+            ->and($ids($nested->startAfter($c)->get()))->toBe([]);
+
+        $cursor = $query->startAfter($b)->toWire()['startAt']['values'];
+        expect(ValueCodec::json($cursor))->toBe('[{},{"__type":"reference","path":"maps/b"}]');
     });
 
     it('keeps an empty map an empty map through merges and nested updates', function () use ($ids) {
@@ -536,6 +603,39 @@ describe('listeners', function () {
             ->and($events[0]->exists)->toBeFalse()
             ->and($events[1]->snapshot()->get('name'))->toBe('Ada')
             ->and($events[1]->listenerId)->toBe($listenerId);
+    });
+
+    it('keeps empty and list-like maps maps in listener payloads and changes', function () {
+        Event::fake([QuerySnapshotChanged::class, DocumentChanged::class]);
+
+        Firestore::collection('maps')->orderBy('n')->listen();
+        Firestore::doc('maps/a')->listen();
+        Firestore::doc('maps/a')->set(['n' => 1, 'empty' => new stdClass, 'numeric' => (object) ['0' => 'x'], 'list' => []]);
+        Firestore::doc('maps/a')->update(['numeric' => (object) ['0' => 'y']]);
+
+        $query = Event::dispatched(QuerySnapshotChanged::class)->map(fn (array $args) => $args[0])->last();
+        $document = Event::dispatched(DocumentChanged::class)->map(fn (array $args) => $args[0])->last();
+
+        // Payloads are what NativePHP delivers: arrays, with ambiguous maps tagged.
+        expect($document->data['empty'])->toBe(['__type' => 'map', 'value' => []])
+            ->and($document->data['numeric'])->toBe(['__type' => 'map', 'value' => ['y']])
+            ->and($document->data['list'])->toBe([]);
+
+        $change = $query->snapshot()->docChanges()[0];
+        $fromDocument = $document->snapshot();
+
+        expect($change->type)->toBe(DocumentChange::MODIFIED)
+            ->and($change->document->get('empty'))->toBeInstanceOf(MapValue::class)
+            ->and($change->document->get('numeric')->toArray())->toBe(['y'])
+            ->and($change->document->get('list'))->toBe([])
+            ->and($query->snapshot()->first()->get('empty'))->toBeInstanceOf(MapValue::class)
+            ->and($fromDocument->get('empty'))->toBeInstanceOf(MapValue::class)
+            ->and($fromDocument->get('numeric.0'))->toBe('y');
+
+        // A snapshot from an event works as a cursor and writes back losslessly.
+        Firestore::doc('maps/copy')->set($fromDocument->data());
+        expect(Firestore::doc('maps/copy')->get()->data())->toEqual($fromDocument->data())
+            ->and(Firestore::collection('maps')->orderBy('empty')->startAfter($fromDocument)->get()->size())->toBe(1);
     });
 
     it('stops listening', function () {

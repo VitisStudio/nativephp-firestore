@@ -2,6 +2,9 @@
 
 use Native\Mobile\Testing\FakeBridge;
 use VitisStudio\NativeFirestore\Bridge\NativeBridge;
+use VitisStudio\NativeFirestore\DTO\MapValue;
+use VitisStudio\NativeFirestore\Events\DocumentChanged;
+use VitisStudio\NativeFirestore\Events\QuerySnapshotChanged;
 use VitisStudio\NativeFirestore\Exceptions\FirebaseAuthException;
 use VitisStudio\NativeFirestore\Exceptions\FirebaseException;
 use VitisStudio\NativeFirestore\Exceptions\FirestoreException;
@@ -9,6 +12,7 @@ use VitisStudio\NativeFirestore\Facades\FirebaseAuth;
 use VitisStudio\NativeFirestore\Facades\Firestore;
 use VitisStudio\NativeFirestore\FieldValue;
 use VitisStudio\NativeFirestore\Query\Transaction;
+use VitisStudio\NativeFirestore\Support\ValueCodec;
 
 // On a device nativephp_call() is a C function; in tests NativePHP's PHP
 // polyfill routes it to FakeBridge, which lets us see the exact wire traffic.
@@ -92,6 +96,51 @@ it('decodes query results', function () {
     expect($snapshot->fromCache())->toBeTrue()
         ->and($snapshot->first()->get('at')->seconds)->toBe(5)
         ->and(payloadOf($this->bridge->callsTo('Firestore.RunQuery')[0])['query']['limit'])->toBe(5);
+});
+
+it('keeps empty and list-like maps maps from native results through cursors and write-back', function () {
+    // Native code tags list-like maps; untagged JSON objects are kept apart from arrays too.
+    $this->bridge->respondTo('Firestore.GetDocument', ['result' => '{"id":"n1","path":"notes/n1","exists":true,'
+        .'"data":{"tagged":{"__type":"map","value":{}},"numeric":{"__type":"map","value":{"0":"a","1":"b"}},'
+        .'"plain":{},"plainNumeric":{"0":"a"},"list":[],"inList":[{}],"map":{"k":{}}},'
+        .'"metadata":{"fromCache":false,"hasPendingWrites":false,"pendingServerTimestamps":[]}}']);
+    $this->bridge->respondTo('Firestore.RunQuery', nativeResult(['documents' => [], 'changes' => [], 'metadata' => ['fromCache' => false, 'hasPendingWrites' => false]]));
+    $this->bridge->respondTo('Firestore.Commit', nativeResult(['committed' => 1]));
+
+    $snapshot = Firestore::doc('notes/n1')->get();
+
+    expect($snapshot->get('tagged'))->toEqual(new MapValue)
+        ->and($snapshot->get('numeric'))->toEqual(new MapValue(['a', 'b']))
+        ->and($snapshot->get('plain'))->toEqual(new MapValue)
+        ->and($snapshot->get('plainNumeric'))->toEqual(new MapValue(['a']))
+        ->and($snapshot->get('list'))->toBe([])
+        ->and($snapshot->get('inList'))->toEqual([new MapValue])
+        ->and($snapshot->get('map.k'))->toEqual(new MapValue);
+
+    Firestore::collection('notes')->orderBy('tagged')->orderBy('numeric')->startAfter($snapshot)->get();
+    Firestore::doc('notes/copy')->set($snapshot->data());
+
+    $query = json_decode($this->bridge->callsTo('Firestore.RunQuery')[0]['params']['payload'])->query;
+    $write = json_decode($this->bridge->callsTo('Firestore.Commit')[0]['params']['payload'])->writes[0]->data;
+
+    expect(ValueCodec::json($query->startAt->values))->toBe('[{},{"0":"a","1":"b"},{"__type":"reference","path":"notes/n1"}]')
+        ->and(ValueCodec::json($write))->toBe('{"tagged":{},"numeric":{"0":"a","1":"b"},"plain":{},"plainNumeric":{"0":"a"},"list":[],"inList":[{}],"map":{"k":{}}}');
+});
+
+it('decodes event payloads whose list-like maps native code tagged', function () {
+    // NativePHP hands events their payload decoded to arrays, so only the tag survives.
+    $payload = json_decode('{"listenerId":"L1","path":"notes","documents":[{"id":"n1","path":"notes/n1","exists":true,'
+        .'"data":{"m":{"__type":"map","value":{}},"n":{"__type":"map","value":{"0":1}},"l":[]},"metadata":{"fromCache":false,"hasPendingWrites":false}}],'
+        .'"changes":[{"type":"added","document":{"id":"n1","path":"notes/n1","exists":true,"data":{"m":{"__type":"map","value":{}}},'
+        .'"metadata":{"fromCache":false,"hasPendingWrites":false}},"oldIndex":-1,"newIndex":0}],"fromCache":false,"hasPendingWrites":false}', true);
+
+    $snapshot = (new QuerySnapshotChanged(...$payload))->snapshot();
+    $document = (new DocumentChanged(listenerId: 'L2', path: 'notes/n1', id: 'n1', exists: true, data: $payload['documents'][0]['data']))->snapshot();
+
+    expect($snapshot->first()->data())->toEqual(['m' => new MapValue, 'n' => new MapValue([1]), 'l' => []])
+        ->and($snapshot->docChanges()[0]->document->get('m'))->toEqual(new MapValue)
+        ->and($document->data())->toEqual($snapshot->first()->data())
+        ->and(ValueCodec::json(ValueCodec::encodeMap($document->data())))->toBe('{"m":{},"n":{"0":1},"l":[]}');
 });
 
 it('maps native error envelopes to typed exceptions', function () {

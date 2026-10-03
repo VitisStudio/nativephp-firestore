@@ -10,6 +10,7 @@ use JsonSerializable;
 use stdClass;
 use VitisStudio\NativeFirestore\DTO\Bytes;
 use VitisStudio\NativeFirestore\DTO\GeoPoint;
+use VitisStudio\NativeFirestore\DTO\MapValue;
 use VitisStudio\NativeFirestore\DTO\Timestamp;
 use VitisStudio\NativeFirestore\FieldValue;
 use VitisStudio\NativeFirestore\Query\DocumentReference;
@@ -17,11 +18,19 @@ use VitisStudio\NativeFirestore\Query\DocumentReference;
 /**
  * Converts PHP values to the JSON wire format the native code understands and
  * back. Firestore types that JSON cannot express travel as tagged maps:
- * {"__type": "timestamp" | "geopoint" | "reference" | "bytes" | "fieldvalue" | "double", ...}.
+ * {"__type": "timestamp" | "geopoint" | "reference" | "bytes" | "fieldvalue" | "double" | "map", ...}.
+ *
+ * Native code sends a map that a PHP array would mistake for a list (empty,
+ * or keyed exactly "0".."n-1") as {"__type": "map", "value": {...}}, so it
+ * stays a map however the JSON is decoded; decode() turns it into a
+ * MapValue. PHP never sends that tag: maps go out as plain JSON objects.
  */
 final class ValueCodec
 {
     public const TYPE_KEY = '__type';
+
+    /** The tag for a map a PHP array cannot tell from a list. */
+    public const TYPE_MAP = 'map';
 
     /** Firestore allows 20 levels of nesting; the native decoders count the same way. */
     public const MAX_DEPTH = 20;
@@ -111,6 +120,7 @@ final class ValueCodec
             $value instanceof DateTimeInterface => Timestamp::fromDateTime($value)->toWire(),
             $value instanceof BackedEnum => $value->value,
             $value instanceof stdClass => self::encodeObject((array) $value, $context, $depth, $underArray),
+            $value instanceof MapValue => self::encodeObject($value->toArray(), $context, $depth, $underArray),
             $value instanceof Arrayable => self::encodeValue($value->toArray(), $context, $depth, $underArray, $directlyInArray),
             $value instanceof JsonSerializable => self::encodeValue($value->jsonSerialize(), $context, $depth, $underArray, $directlyInArray),
             is_array($value) && array_is_list($value) => self::encodeList($value, $context, $depth, $directlyInArray),
@@ -223,12 +233,153 @@ final class ValueCodec
     }
 
     /**
-     * @param  array<string, mixed>  $map
-     * @return array<string, mixed>
+     * Decode document data. The top level of a document is always a map, so
+     * it comes back as a plain array even when it is empty or list-like.
+     *
+     * @param  array<array-key, mixed>  $map
+     * @return array<array-key, mixed>
      */
     public static function decodeMap(array $map): array
     {
-        return array_map(self::decode(...), $map);
+        return array_map(self::decode(...), self::unwrapMap($map));
+    }
+
+    /**
+     * The entries of wire map data, unwrapping the tagged form.
+     *
+     * @param  array<array-key, mixed>  $map
+     * @return array<array-key, mixed>
+     */
+    public static function unwrapMap(array $map): array
+    {
+        return self::isTaggedMap($map) ? (array) $map['value'] : $map;
+    }
+
+    /**
+     * Decode a JSON result from native code, keeping JSON objects apart from
+     * JSON arrays: objects become associative arrays, except those a PHP
+     * array would mistake for a list, which become tagged maps (the same
+     * form native code uses in event payloads).
+     */
+    public static function fromJson(string $json): mixed
+    {
+        return self::normaliseObjects(json_decode($json, false, 512, JSON_THROW_ON_ERROR), true);
+    }
+
+    /**
+     * Rebuild PHP-decoded JSON (objects as stdClass) in the bridge shape.
+     */
+    public static function normaliseObjects(mixed $value, bool $topLevel = false): mixed
+    {
+        if (is_array($value)) {
+            return array_map(fn (mixed $element) => self::normaliseObjects($element), $value);
+        }
+
+        if (! $value instanceof stdClass) {
+            return $value;
+        }
+
+        $properties = get_object_vars($value);
+
+        // Already tagged by native code: its entries are a map by definition.
+        if (($properties[self::TYPE_KEY] ?? null) === self::TYPE_MAP && ($properties['value'] ?? null) instanceof stdClass) {
+            return [self::TYPE_KEY => self::TYPE_MAP, 'value' => self::normaliseObjects($properties['value'], true)];
+        }
+
+        $entries = array_map(fn (mixed $element) => self::normaliseObjects($element), $properties);
+
+        if ($topLevel || ! MapValue::isAmbiguous($entries)) {
+            return $entries;
+        }
+
+        return [self::TYPE_KEY => self::TYPE_MAP, 'value' => $entries];
+    }
+
+    /**
+     * Look up a dotted field in wire map data without decoding it.
+     *
+     * @param  array<array-key, mixed>  $data
+     * @return array{0: bool, 1: mixed} [found, wire value]
+     */
+    public static function wireField(array $data, string $field): array
+    {
+        $current = $data;
+        $isMap = true; // document data is a map even when it looks like a list
+
+        foreach (explode('.', $field) as $segment) {
+            if (! is_array($current)) {
+                return [false, null];
+            }
+
+            if (self::isTaggedMap($current)) {
+                $current = (array) $current['value'];
+            } elseif (! $isMap && (self::isTagged($current) || ($current !== [] && array_is_list($current)))) {
+                return [false, null]; // typed values and lists have no fields
+            }
+
+            if (! array_key_exists($segment, $current)) {
+                return [false, null];
+            }
+
+            $current = $current[$segment];
+            $isMap = false;
+        }
+
+        return [true, $current];
+    }
+
+    /**
+     * Turn a wire value read from a snapshot back into a query argument
+     * (e.g. a cursor value) without passing through the lossy PHP form:
+     * tagged maps become JSON objects again, other tags pass through.
+     */
+    public static function wireArgument(mixed $value): mixed
+    {
+        if (! is_array($value)) {
+            return $value;
+        }
+
+        if (self::isTaggedMap($value)) {
+            $map = new stdClass;
+
+            foreach ((array) $value['value'] as $key => $element) {
+                $map->{(string) $key} = self::wireArgument($element);
+            }
+
+            return $map;
+        }
+
+        if (self::isTagged($value)) {
+            return $value;
+        }
+
+        if (array_is_list($value)) {
+            return array_map(self::wireArgument(...), $value);
+        }
+
+        $map = new stdClass;
+
+        foreach ($value as $key => $element) {
+            $map->{(string) $key} = self::wireArgument($element);
+        }
+
+        return $map;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $value
+     */
+    private static function isTagged(array $value): bool
+    {
+        return isset($value[self::TYPE_KEY]) && is_string($value[self::TYPE_KEY]);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $value
+     */
+    private static function isTaggedMap(array $value): bool
+    {
+        return ($value[self::TYPE_KEY] ?? null) === self::TYPE_MAP && array_key_exists('value', $value);
     }
 
     /**
@@ -247,8 +398,20 @@ final class ValueCodec
                 '-Infinity' => -INF,
                 default => (float) $value['value'],
             },
+            self::TYPE_MAP => self::decodeTaggedMap((array) ($value['value'] ?? [])),
             default => array_map(self::decode(...), $value),
         };
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return MapValue|array<array-key, mixed>
+     */
+    private static function decodeTaggedMap(array $entries): MapValue|array
+    {
+        $decoded = array_map(self::decode(...), $entries);
+
+        return MapValue::isAmbiguous($decoded) ? new MapValue($decoded) : $decoded;
     }
 
     private static function encodeFloat(float $value): float|array

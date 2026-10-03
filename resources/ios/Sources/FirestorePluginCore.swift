@@ -626,12 +626,20 @@ enum NFSCodec {
             return list.map { encode($0) }
         }
         if let map = value as? [String: Any] {
-            return map.mapValues { encode($0) }
+            let encoded = map.mapValues { encode($0) }
+            // PHP decodes an empty map, or one keyed exactly "0".."n-1", as a
+            // list, so those travel tagged and stay maps on the PHP side.
+            return isListLike(map) ? ["__type": "map", "value": encoded] as [String: Any] : encoded
         }
 
         return String(describing: value)
     }
 
+    static func isListLike(_ map: [String: Any]) -> Bool {
+        Set(map.keys) == Set((0..<map.count).map { String($0) })
+    }
+
+    /// Document data: always a map, so the top level is never tagged.
     static func encodeMap(_ map: [String: Any]?) -> Any {
         guard let map else { return NSNull() }
         // An empty map must stay a JSON object.

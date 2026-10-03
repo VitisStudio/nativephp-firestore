@@ -8,6 +8,7 @@ use Illuminate\Support\Str;
 use PHPUnit\Framework\Assert as PHPUnit;
 use stdClass;
 use VitisStudio\NativeFirestore\Contracts\FirestoreDriver;
+use VitisStudio\NativeFirestore\DTO\MapValue;
 use VitisStudio\NativeFirestore\DTO\Timestamp;
 use VitisStudio\NativeFirestore\Events\DocumentChanged;
 use VitisStudio\NativeFirestore\Events\QuerySnapshotChanged;
@@ -102,7 +103,7 @@ class FakeFirestore implements FirestoreDriver
     {
         $path = Path::document($path);
 
-        return isset($this->documents[$path]) ? ValueCodec::decodeMap($this->export($this->documents[$path])) : null;
+        return isset($this->documents[$path]) ? ValueCodec::decodeMap($this->export($this->nativeData($this->documents[$path]))) : null;
     }
 
     /**
@@ -117,7 +118,7 @@ class FakeFirestore implements FirestoreDriver
 
         foreach ($this->documents as $path => $data) {
             if (Path::parent($path) === $collectionPath) {
-                $result[Path::lastSegment($path)] = ValueCodec::decodeMap($this->export($data));
+                $result[Path::lastSegment($path)] = ValueCodec::decodeMap($this->export($this->nativeData($data)));
             }
         }
 
@@ -638,7 +639,7 @@ class FakeFirestore implements FirestoreDriver
             'id' => Path::lastSegment($path),
             'path' => $path,
             'exists' => $exists,
-            'data' => $exists ? $this->documents[$path] : null,
+            'data' => $exists ? $this->nativeData($this->documents[$path]) : null,
             'metadata' => ['fromCache' => ! $this->networkEnabled, 'hasPendingWrites' => false, 'pendingServerTimestamps' => []],
         ];
     }
@@ -955,7 +956,7 @@ class FakeFirestore implements FirestoreDriver
                 'path' => $snapshot['path'],
                 'id' => $snapshot['id'],
                 'exists' => $snapshot['exists'],
-                'data' => $this->export($snapshot['data']),
+                'data' => $this->wire($snapshot['data']),
                 'fromCache' => $snapshot['metadata']['fromCache'],
                 'hasPendingWrites' => false,
                 'pendingServerTimestamps' => [],
@@ -975,8 +976,8 @@ class FakeFirestore implements FirestoreDriver
         $this->emit(QuerySnapshotChanged::class, [
             'listenerId' => $id,
             'path' => $target['query']['path'],
-            'documents' => $this->export($snapshot['documents']),
-            'changes' => $this->export($snapshot['changes']),
+            'documents' => $this->wire($snapshot['documents']),
+            'changes' => $this->wire($snapshot['changes']),
             'fromCache' => $snapshot['metadata']['fromCache'],
             'hasPendingWrites' => false,
         ]);
@@ -1075,7 +1076,8 @@ class FakeFirestore implements FirestoreDriver
     }
 
     /**
-     * Normalise a payload exactly as the JSON bridge would.
+     * Normalise a payload as JSON decoded to PHP arrays: what event payloads
+     * look like after NativePHP delivers them.
      */
     private function wire(mixed $payload): mixed
     {
@@ -1083,12 +1085,44 @@ class FakeFirestore implements FirestoreDriver
     }
 
     /**
-     * Typed data back in the shape the native bridge returns (JSON decoded to
-     * PHP arrays), as consumers see it.
+     * Typed data back in the shape the native bridge returns, as consumers
+     * see it.
      */
     private function export(mixed $value): mixed
     {
-        return $this->wire($value);
+        return ValueCodec::fromJson(ValueCodec::json($value));
+    }
+
+    /**
+     * Stored document data as native code sends it: nested maps that PHP
+     * would mistake for lists (empty, or keyed "0".."n-1") tagged as maps.
+     */
+    private function nativeData(stdClass $data): stdClass
+    {
+        $result = new stdClass;
+
+        foreach (get_object_vars($data) as $key => $value) {
+            $result->{$key} = $this->nativeValue($value);
+        }
+
+        return $result;
+    }
+
+    private function nativeValue(mixed $value): mixed
+    {
+        if (is_array($value)) {
+            return WireValues::isTagged($value) ? $value : array_map($this->nativeValue(...), $value);
+        }
+
+        if (! $value instanceof stdClass) {
+            return $value;
+        }
+
+        $map = $this->nativeData($value);
+
+        return MapValue::isAmbiguous(get_object_vars($map))
+            ? [ValueCodec::TYPE_KEY => ValueCodec::TYPE_MAP, 'value' => $map]
+            : $map;
     }
 
     /**

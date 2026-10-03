@@ -2,7 +2,6 @@
 
 namespace VitisStudio\NativeFirestore\Query;
 
-use Illuminate\Support\Arr;
 use InvalidArgumentException;
 use VitisStudio\NativeFirestore\DTO\DocumentSnapshot;
 use VitisStudio\NativeFirestore\DTO\QuerySnapshot;
@@ -216,7 +215,7 @@ class Query
      */
     private function snapshotCursorValues(array $wire, DocumentSnapshot $snapshot): array
     {
-        $missing = QueryRules::missingCursorFields($wire, fn (string $field) => Arr::has($snapshot->data() ?? [], $field));
+        $missing = QueryRules::missingCursorFields($wire, fn (string $field) => $snapshot->wireField($field)[0]);
 
         if ($missing !== []) {
             throw new InvalidArgumentException(sprintf(
@@ -239,7 +238,9 @@ class Query
         }
 
         return array_map(
-            fn (array $order) => ValueCodec::encodeArgument($order['field'] === '__name__' ? $snapshot->reference() : $snapshot->get($order['field'])),
+            fn (array $order) => $order['field'] === '__name__'
+                ? ValueCodec::encodeArgument($snapshot->reference())
+                : ValueCodec::wireArgument($snapshot->wireField($order['field'])[1]),
             $orderBy,
         );
     }

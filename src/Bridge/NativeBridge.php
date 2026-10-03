@@ -13,7 +13,8 @@ use VitisStudio\NativeFirestore\Support\ValueCodec;
  *
  * Wire protocol: arguments travel JSON-encoded in a single "payload" string
  * (so nested maps arrive identically on iOS and Android); results come back
- * JSON-encoded in "result"; failures use NativePHP's
+ * JSON-encoded in "result" (decoded by ValueCodec::fromJson(), which keeps
+ * list-like maps maps); failures use NativePHP's
  * {"status": "error", "code", "message"} envelope with Firebase error codes.
  *
  * Before the first operation in a PHP process the bridge sends the app's
@@ -137,7 +138,9 @@ class NativeBridge
             return null;
         }
 
-        return json_decode($result, true, 512, JSON_THROW_ON_ERROR);
+        // Objects stay distinguishable from arrays, so an empty map in a
+        // document never turns into an empty list.
+        return ValueCodec::fromJson($result);
     }
 
     private function normaliseCode(string $code): string

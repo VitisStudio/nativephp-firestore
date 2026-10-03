@@ -570,15 +570,26 @@ internal object NfsCodec {
         is Float -> encode(value.toDouble())
         is Number -> value.toLong()
         is List<*> -> value.map { encode(it) }
-        is Map<*, *> -> value.entries.associate { it.key.toString() to encode(it.value) }
+        is Map<*, *> -> {
+            val encoded = encodeMap(value)
+            // PHP decodes an empty map, or one keyed exactly "0".."n-1", as a
+            // list, so those travel tagged and stay maps on the PHP side.
+            if (isListLike(encoded)) mapOf("__type" to "map", "value" to encoded) else encoded
+        }
         else -> value.toString()
     }
+
+    /** Document data: always a map, so the top level is never tagged. */
+    fun encodeMap(map: Map<*, *>): Map<String, Any?> = map.entries.associate { it.key.toString() to encode(it.value) }
+
+    private fun isListLike(map: Map<String, Any?>): Boolean =
+        map.keys == (0 until map.size).map { it.toString() }.toSet()
 
     fun document(snapshot: DocumentSnapshot): Map<String, Any?> = mapOf(
         "id" to snapshot.id,
         "path" to snapshot.reference.path,
         "exists" to snapshot.exists(),
-        "data" to if (snapshot.exists()) encode(snapshot.getData(NfsRuntime.serverTimestamps) ?: emptyMap<String, Any?>()) else null,
+        "data" to if (snapshot.exists()) encodeMap(snapshot.getData(NfsRuntime.serverTimestamps) ?: emptyMap<String, Any?>()) else null,
         "metadata" to metadata(snapshot.metadata) + ("pendingServerTimestamps" to pendingServerTimestamps(snapshot)),
     )
 

@@ -211,12 +211,15 @@ Firestore::collection('users')->add(['name' => 'Grace']); // auto id, returns th
 | PHP | Firestore |
 |---|---|
 | `null`, `bool`, `int`, `float`, `string` | same (`10.0` stays a double) |
-| list arrays / associative arrays | array / map (`[]` is an empty array; use `new stdClass` for an empty map) |
+| list arrays / associative arrays | array / map (`[]` is an empty array; use `new MapValue`, `new stdClass` or `(object) []` for an empty map) |
+| `DTO\MapValue`, `stdClass` | map (always, even when empty or keyed `"0"`, `"1"`, …) |
 | `DTO\Timestamp`, any `DateTimeInterface` | timestamp (read back as `Timestamp`; `->toDateTime()` gives Carbon) |
 | `DTO\GeoPoint` | geopoint |
 | `Query\DocumentReference` | reference (read back as a live `DocumentReference`) |
 | `DTO\Bytes` | bytes |
 | `NAN`, `INF` | NaN / Infinity |
+
+**Maps that look like lists.** Snapshots return maps as associative arrays and Firestore arrays as PHP lists. A map that a PHP array can't tell apart from a list (an empty map, or one keyed exactly `"0"`, `"1"`, … `"n-1"`) comes back as an immutable `DTO\MapValue` instead. It reads like an array (`$map['0']`, `count()`, `foreach`, dotted `$snapshot->get('prefs.0')`), `->toArray()` gives its entries, and writing it back (or passing the snapshot as a query cursor) keeps it a map. Writing `[]` always stores an empty array; write `new MapValue` (or `new stdClass`) for an empty map.
 
 `FieldValue::serverTimestamp()`, `FieldValue::increment(1)`, `FieldValue::arrayUnion(...)`, `FieldValue::arrayRemove(...)` and `FieldValue::delete()` work as field values in writes, but not anywhere beneath an array (even inside a map inside an array), not inside `arrayUnion`/`arrayRemove` elements, and not in queries. `FieldValue::delete()` is only allowed in a merge `set()` or as a top-level `update()` value.
 
@@ -233,6 +236,8 @@ The plugin enforces the rest of Firestore's write rules in PHP, throwing `Invali
 | `Events\ListenerFailed` | `listenerId`, `code`, `message` (the listener is already detached) |
 | `Events\WriteFailed` | `paths`, `code`, `message` |
 | `Events\AuthStateChanged` | `user` (array or `null`) |
+
+Document data in `documents`, `changes` and `data` is in wire form (typed values and list-like maps still tagged, e.g. `{"__type": "map", "value": {}}`); call `snapshot()` on the event, or `QuerySnapshot::fromArray()` / `DocumentSnapshot::fromArray()`, for decoded values.
 
 In a NativeComponent, handle them with `#[On]`. Parameters bind to payload keys by name:
 
