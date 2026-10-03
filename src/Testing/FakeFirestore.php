@@ -5,6 +5,7 @@ namespace VitisStudio\NativeFirestore\Testing;
 use Closure;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Str;
+use LogicException;
 use PHPUnit\Framework\Assert as PHPUnit;
 use stdClass;
 use VitisStudio\NativeFirestore\Contracts\FirestoreDriver;
@@ -385,6 +386,7 @@ class FakeFirestore implements FirestoreDriver
                 : ['type' => 'query', 'query' => $this->typedQuery((array) ($target['query'] ?? []))],
             'includeMetadataChanges' => $includeMetadataChanges,
             'last' => null,
+            'lastData' => [],
         ];
 
         $this->notifyListener($id);
@@ -646,15 +648,17 @@ class FakeFirestore implements FirestoreDriver
 
     /**
      * @param  array<string, mixed>  $query
+     * @param  list<array<string, mixed>>  $previous
+     * @param  array<string, stdClass>  $previousData
      * @return array<string, mixed>
      */
-    private function querySnapshot(array $query, ?array $previous = null): array
+    private function querySnapshot(array $query, array $previous = [], array $previousData = []): array
     {
         $documents = array_map(fn (string $path) => $this->documentSnapshot($path), $this->evaluateQuery($query));
 
         return [
             'documents' => $documents,
-            'changes' => $this->diff($previous ?? [], $documents),
+            'changes' => $this->diff($previous, $previousData, $documents, QueryRules::normalizedOrderBy($query)),
             'metadata' => ['fromCache' => ! $this->networkEnabled, 'hasPendingWrites' => false],
         ];
     }
@@ -965,13 +969,16 @@ class FakeFirestore implements FirestoreDriver
             return;
         }
 
-        $snapshot = $this->querySnapshot($target['query'], $listener['last'] ?? []);
+        $snapshot = $this->querySnapshot($target['query'], $listener['last'] ?? [], $listener['lastData']);
 
         if ($listener['last'] !== null && $snapshot['changes'] === [] && array_column($snapshot['documents'], 'path') === array_column($listener['last'], 'path')) {
             return;
         }
 
         $this->listeners[$id]['last'] = $snapshot['documents'];
+        // Stored maps are never changed in place, so keeping them is enough to
+        // compare a document's old version against the new ones later.
+        $this->listeners[$id]['lastData'] = array_intersect_key($this->documents, array_flip(array_column($snapshot['documents'], 'path')));
 
         $this->emit(QuerySnapshotChanged::class, [
             'listenerId' => $id,
@@ -984,31 +991,104 @@ class FakeFirestore implements FirestoreDriver
     }
 
     /**
+     * Document changes computed the way the SDKs do, so they can be applied
+     * one after another to the previous list: removals first, then additions,
+     * then modifications (each group in query order), every index taken from
+     * a running copy of the list that already reflects the earlier changes.
+     * Positions in that running list are found with the query's ordering,
+     * because a modified document not yet moved still sits where its old
+     * values put it.
+     *
      * @param  list<array<string, mixed>>  $old
+     * @param  array<string, stdClass>  $oldData
      * @param  list<array<string, mixed>>  $new
+     * @param  list<array{field: string, direction: string}>  $orderBy
      * @return list<array<string, mixed>>
      */
-    private function diff(array $old, array $new): array
+    private function diff(array $old, array $oldData, array $new, array $orderBy): array
     {
-        $oldIndex = array_flip(array_column($old, 'path'));
-        $newIndex = array_flip(array_column($new, 'path'));
+        $oldByPath = array_column($old, null, 'path');
+        $newPaths = array_flip(array_column($new, 'path'));
+
+        $removed = array_values(array_filter($old, fn (array $document) => ! isset($newPaths[$document['path']])));
+        $added = array_values(array_filter($new, fn (array $document) => ! isset($oldByPath[$document['path']])));
+        $modified = array_values(array_filter(
+            $new,
+            fn (array $document) => isset($oldByPath[$document['path']]) && $oldByPath[$document['path']]['data'] != $document['data'],
+        ));
+
+        /** @var list<array{path: string, data: stdClass}> $tracker */
+        $tracker = array_map(fn (array $document) => ['path' => $document['path'], 'data' => $oldData[$document['path']] ?? new stdClass], $old);
         $changes = [];
 
-        foreach ($old as $index => $document) {
-            if (! isset($newIndex[$document['path']])) {
-                $changes[] = ['type' => 'removed', 'document' => $document, 'oldIndex' => $index, 'newIndex' => -1];
+        $indexOf = function (string $path) use (&$tracker): int {
+            foreach ($tracker as $index => $entry) {
+                if ($entry['path'] === $path) {
+                    return $index;
+                }
             }
+
+            throw new LogicException("Document [{$path}] is not in the previous snapshot.");
+        };
+
+        $insert = function (string $path) use (&$tracker, $orderBy): int {
+            $entry = ['path' => $path, 'data' => $this->documents[$path]];
+            $position = count($tracker);
+
+            foreach ($tracker as $index => $other) {
+                if ($this->compareVersions($orderBy, $entry, $other) < 0) {
+                    $position = $index;
+
+                    break;
+                }
+            }
+
+            array_splice($tracker, $position, 0, [$entry]);
+
+            return $position;
+        };
+
+        foreach ($removed as $document) {
+            $index = $indexOf($document['path']);
+            array_splice($tracker, $index, 1);
+            $changes[] = ['type' => 'removed', 'document' => $document, 'oldIndex' => $index, 'newIndex' => -1];
         }
 
-        foreach ($new as $index => $document) {
-            if (! isset($oldIndex[$document['path']])) {
-                $changes[] = ['type' => 'added', 'document' => $document, 'oldIndex' => -1, 'newIndex' => $index];
-            } elseif ($old[$oldIndex[$document['path']]]['data'] != $document['data']) {
-                $changes[] = ['type' => 'modified', 'document' => $document, 'oldIndex' => $oldIndex[$document['path']], 'newIndex' => $index];
-            }
+        foreach ($added as $document) {
+            $changes[] = ['type' => 'added', 'document' => $document, 'oldIndex' => -1, 'newIndex' => $insert($document['path'])];
+        }
+
+        foreach ($modified as $document) {
+            $index = $indexOf($document['path']);
+            array_splice($tracker, $index, 1);
+            $changes[] = ['type' => 'modified', 'document' => $document, 'oldIndex' => $index, 'newIndex' => $insert($document['path'])];
         }
 
         return $changes;
+    }
+
+    /**
+     * Compare two document versions (path plus stored data) by the query ordering.
+     *
+     * @param  list<array{field: string, direction: string}>  $orderBy
+     * @param  array{path: string, data: stdClass}  $a
+     * @param  array{path: string, data: stdClass}  $b
+     */
+    private function compareVersions(array $orderBy, array $a, array $b): int
+    {
+        $value = fn (array $version, string $field) => $field === '__name__'
+            ? ['__type' => 'reference', 'path' => $version['path']]
+            : $this->lookup($version['data'], explode('.', $field))[1];
+
+        foreach ($orderBy as $order) {
+            $result = WireValues::compare($value($a, $order['field']), $value($b, $order['field']));
+
+            if ($result !== 0) {
+                return $order['direction'] === 'desc' ? -$result : $result;
+            }
+        }
+
+        return 0;
     }
 
     /**

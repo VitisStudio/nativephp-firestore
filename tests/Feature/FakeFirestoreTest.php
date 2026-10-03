@@ -590,6 +590,63 @@ describe('listeners', function () {
             ->and($snapshots[3]->fromCache())->toBeFalse();
     });
 
+    it('reports changes whose indices apply one after another, like the SDKs', function (array $seed, Closure $query, Closure $write, array $expectedChanges) {
+        Event::fake([QuerySnapshotChanged::class]);
+        foreach ($seed as $id => $n) {
+            Firestore::doc("items/{$id}")->set(['n' => $n]);
+        }
+
+        $query(Firestore::collection('items'))->listen();
+        $batch = Firestore::batch();
+        $write($batch);
+        $batch->commit();
+
+        $snapshots = Event::dispatched(QuerySnapshotChanged::class)->map(fn (array $args) => $args[0]->snapshot())->values();
+        expect($snapshots)->toHaveCount(2);
+
+        $ids = fn ($snapshot) => array_map(fn ($document) => $document->id(), $snapshot->documents());
+        $list = $ids($snapshots[0]);
+        $described = [];
+
+        foreach ($snapshots[1]->docChanges() as $change) {
+            $described[] = "{$change->type}:{$change->document->id()}:{$change->oldIndex}:{$change->newIndex}";
+
+            if ($change->type !== 'added') {
+                expect($list[$change->oldIndex])->toBe($change->document->id());
+                array_splice($list, $change->oldIndex, 1);
+            }
+
+            if ($change->type !== 'removed') {
+                array_splice($list, $change->newIndex, 0, [$change->document->id()]);
+            }
+        }
+
+        expect($list)->toBe($ids($snapshots[1]))
+            ->and($described)->toBe($expectedChanges);
+    })->with([
+        'two removals ahead of the survivor' => [
+            ['a' => 1, 'b' => 2, 'c' => 3], fn ($q) => $q->orderBy('n'),
+            fn ($batch) => $batch->delete('items/a')->delete('items/b'),
+            ['removed:a:0:-1', 'removed:b:0:-1'],
+        ],
+        'removals, additions and moves together' => [
+            ['a' => 1, 'b' => 2, 'c' => 3, 'd' => 4, 'e' => 5], fn ($q) => $q->orderBy('n'),
+            fn ($batch) => $batch->delete('items/b')->set('items/x', ['n' => 0])->set('items/y', ['n' => 4.5])
+                ->update('items/e', ['n' => 0.5])->update('items/a', ['n' => 6])->delete('items/d'),
+            ['removed:b:1:-1', 'removed:d:2:-1', 'added:x:-1:0', 'added:y:-1:3', 'modified:e:4:1', 'modified:a:2:4'],
+        ],
+        'in-place modifications and a reversal under descending order' => [
+            ['a' => 1, 'b' => 2, 'c' => 3], fn ($q) => $q->orderBy('n', 'desc'),
+            fn ($batch) => $batch->update('items/a', ['n' => 9])->update('items/c', ['n' => 0])->update('items/b', ['n' => 2, 'tag' => 'x']),
+            ['modified:a:2:0', 'modified:b:2:2', 'modified:c:1:2'],
+        ],
+        'a limited window dropping and pulling in documents' => [
+            ['a' => 1, 'b' => 2, 'c' => 3, 'd' => 4], fn ($q) => $q->orderBy('n')->limit(3),
+            fn ($batch) => $batch->update('items/a', ['n' => 10])->delete('items/b')->set('items/e', ['n' => 1.5]),
+            ['removed:a:0:-1', 'removed:b:0:-1', 'added:e:-1:0', 'added:d:-1:2'],
+        ],
+    ]);
+
     it('listens to a single document', function () {
         Event::fake([DocumentChanged::class]);
 
