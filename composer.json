@@ -1,0 +1,64 @@
+{
+    "name": "vitisstudio/nativephp-firestore",
+    "description": "Cloud Firestore and Firebase Authentication for NativePHP Mobile, backed by the native Firebase SDKs on iOS and Android.",
+    "type": "nativephp-plugin",
+    "license": "MIT",
+    "keywords": [
+        "nativephp",
+        "nativephp-plugin",
+        "firebase",
+        "firestore",
+        "firebase-auth",
+        "mobile",
+        "offline"
+    ],
+    "authors": [
+        {
+            "name": "Vitis Studio"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "illuminate/support": "^11.0|^12.0|^13.0",
+        "nativephp/mobile": "^3.0|^4.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0|^11.0",
+        "pestphp/pest": "^3.0|^4.0|^5.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "VitisStudio\\NativeFirestore\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "VitisStudio\\NativeFirestore\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "pest"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "VitisStudio\\NativeFirestore\\FirestoreServiceProvider"
+            ],
+            "aliases": {
+                "Firestore": "VitisStudio\\NativeFirestore\\Facades\\Firestore",
+                "FirebaseAuth": "VitisStudio\\NativeFirestore\\Facades\\FirebaseAuth"
+            }
+        },
+        "nativephp": {
+            "manifest": "nativephp.json"
+        }
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

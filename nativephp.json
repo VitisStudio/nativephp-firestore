@@ -1,0 +1,222 @@
+{
+    "name": "vitisstudio/nativephp-firestore",
+    "version": "0.1.0",
+    "description": "Cloud Firestore and Firebase Authentication backed by the native Firebase SDKs.",
+    "namespace": "Firestore",
+    "keywords": [
+        "firebase",
+        "firestore",
+        "auth",
+        "database",
+        "offline",
+        "realtime"
+    ],
+    "category": "data",
+    "license": "MIT",
+    "pricing": {
+        "type": "free"
+    },
+    "author": {
+        "name": "Vitis Studio"
+    },
+    "platforms": [
+        "android",
+        "ios"
+    ],
+    "bridge_functions": [
+        {
+            "name": "Firestore.Configure",
+            "ios": "FirestoreFunctions.Configure",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.Configure",
+            "description": "Initialise Firebase (once) and apply Firestore/Auth settings"
+        },
+        {
+            "name": "Firestore.Status",
+            "ios": "FirestoreFunctions.Status",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.Status",
+            "description": "Report whether Firebase is configured and with which project"
+        },
+        {
+            "name": "Firestore.GetDocument",
+            "ios": "FirestoreFunctions.GetDocument",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.GetDocument",
+            "description": "Read a single document"
+        },
+        {
+            "name": "Firestore.RunQuery",
+            "ios": "FirestoreFunctions.RunQuery",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.RunQuery",
+            "description": "Run a collection / collection-group query"
+        },
+        {
+            "name": "Firestore.Count",
+            "ios": "FirestoreFunctions.Count",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.Count",
+            "description": "Run a count() aggregation for a query"
+        },
+        {
+            "name": "Firestore.Commit",
+            "ios": "FirestoreFunctions.Commit",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.Commit",
+            "description": "Atomically apply one or more writes (set / update / delete)"
+        },
+        {
+            "name": "Firestore.TransactionBegin",
+            "ios": "FirestoreFunctions.TransactionBegin",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.TransactionBegin",
+            "description": "Start a native transaction session"
+        },
+        {
+            "name": "Firestore.TransactionGet",
+            "ios": "FirestoreFunctions.TransactionGet",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.TransactionGet",
+            "description": "Read a document inside a transaction session"
+        },
+        {
+            "name": "Firestore.TransactionCommit",
+            "ios": "FirestoreFunctions.TransactionCommit",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.TransactionCommit",
+            "description": "Hand the buffered writes to the transaction and wait for the outcome"
+        },
+        {
+            "name": "Firestore.TransactionAbort",
+            "ios": "FirestoreFunctions.TransactionAbort",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.TransactionAbort",
+            "description": "Abort a transaction session"
+        },
+        {
+            "name": "Firestore.Listen",
+            "ios": "FirestoreFunctions.Listen",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.Listen",
+            "description": "Attach a realtime snapshot listener to a document or query"
+        },
+        {
+            "name": "Firestore.StopListening",
+            "ios": "FirestoreFunctions.StopListening",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.StopListening",
+            "description": "Detach a snapshot listener"
+        },
+        {
+            "name": "Firestore.StopAllListeners",
+            "ios": "FirestoreFunctions.StopAllListeners",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.StopAllListeners",
+            "description": "Detach every snapshot listener"
+        },
+        {
+            "name": "Firestore.EnableNetwork",
+            "ios": "FirestoreFunctions.EnableNetwork",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.EnableNetwork",
+            "description": "Re-enable network access for Firestore"
+        },
+        {
+            "name": "Firestore.DisableNetwork",
+            "ios": "FirestoreFunctions.DisableNetwork",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.DisableNetwork",
+            "description": "Disable network access (serve from cache, queue writes)"
+        },
+        {
+            "name": "Firestore.WaitForPendingWrites",
+            "ios": "FirestoreFunctions.WaitForPendingWrites",
+            "android": "com.vitisstudio.plugins.firestore.FirestoreFunctions.WaitForPendingWrites",
+            "description": "Wait until all pending writes are acknowledged by the backend"
+        },
+        {
+            "name": "FirebaseAuth.SignInWithEmailAndPassword",
+            "ios": "FirebaseAuthFunctions.SignInWithEmailAndPassword",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.SignInWithEmailAndPassword",
+            "description": "Sign in with email and password"
+        },
+        {
+            "name": "FirebaseAuth.CreateUserWithEmailAndPassword",
+            "ios": "FirebaseAuthFunctions.CreateUserWithEmailAndPassword",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.CreateUserWithEmailAndPassword",
+            "description": "Create an account and sign in"
+        },
+        {
+            "name": "FirebaseAuth.SignInAnonymously",
+            "ios": "FirebaseAuthFunctions.SignInAnonymously",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.SignInAnonymously",
+            "description": "Sign in anonymously"
+        },
+        {
+            "name": "FirebaseAuth.SignOut",
+            "ios": "FirebaseAuthFunctions.SignOut",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.SignOut",
+            "description": "Sign out the current user"
+        },
+        {
+            "name": "FirebaseAuth.CurrentUser",
+            "ios": "FirebaseAuthFunctions.CurrentUser",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.CurrentUser",
+            "description": "Return the signed-in user, if any"
+        },
+        {
+            "name": "FirebaseAuth.GetIdToken",
+            "ios": "FirebaseAuthFunctions.GetIdToken",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.GetIdToken",
+            "description": "Return the current user's ID token"
+        },
+        {
+            "name": "FirebaseAuth.SendPasswordResetEmail",
+            "ios": "FirebaseAuthFunctions.SendPasswordResetEmail",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.SendPasswordResetEmail",
+            "description": "Send a password reset email"
+        },
+        {
+            "name": "FirebaseAuth.Listen",
+            "ios": "FirebaseAuthFunctions.Listen",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.Listen",
+            "description": "Start dispatching AuthStateChanged events"
+        },
+        {
+            "name": "FirebaseAuth.StopListening",
+            "ios": "FirebaseAuthFunctions.StopListening",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.StopListening",
+            "description": "Stop dispatching AuthStateChanged events"
+        }
+    ],
+    "android": {
+        "min_version": 26,
+        "permissions": [
+            "android.permission.INTERNET",
+            "android.permission.ACCESS_NETWORK_STATE"
+        ],
+        "dependencies": {
+            "implementation": [
+                "platform(com.google.firebase:firebase-bom:34.0.0)",
+                "com.google.firebase:firebase-firestore",
+                "com.google.firebase:firebase-auth"
+            ]
+        },
+        "proguard_rules": [
+            "-keep class com.vitisstudio.plugins.firestore.** { *; }"
+        ]
+    },
+    "ios": {
+        "min_version": "15.0",
+        "dependencies": {
+            "swift_packages": [
+                {
+                    "url": "https://github.com/firebase/firebase-ios-sdk",
+                    "version": "12.0.0",
+                    "products": [
+                        "FirebaseFirestore",
+                        "FirebaseAuth"
+                    ]
+                }
+            ],
+            "pods": []
+        }
+    },
+    "events": [
+        "VitisStudio\\NativeFirestore\\Events\\DocumentChanged",
+        "VitisStudio\\NativeFirestore\\Events\\QuerySnapshotChanged",
+        "VitisStudio\\NativeFirestore\\Events\\ListenerFailed",
+        "VitisStudio\\NativeFirestore\\Events\\WriteFailed",
+        "VitisStudio\\NativeFirestore\\Events\\AuthStateChanged"
+    ],
+    "service_provider": "VitisStudio\\NativeFirestore\\FirestoreServiceProvider",
+    "hooks": {
+        "copy_assets": "nativephp:firestore:copy-config"
+    }
+}
