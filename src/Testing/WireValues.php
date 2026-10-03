@@ -5,9 +5,9 @@ namespace VitisStudio\NativeFirestore\Testing;
 use stdClass;
 
 /**
- * Firestore's value ordering and equality, applied to wire-format values.
- * Used by the in-memory fake to evaluate filters, orderBy and cursors the way
- * the real backend does.
+ * Firestore's value ordering and equality, applied to wire-format values,
+ * mirroring the SDK's model/value_util.cc. Used by the in-memory fake to
+ * evaluate filters, orderBy, cursors and transforms the way the SDK does.
  *
  * Cross-type order: null < booleans < numbers < timestamps < strings < bytes
  * < references < geopoints < arrays < maps.
@@ -76,20 +76,44 @@ final class WireValues
         };
     }
 
+    /**
+     * The SDK's Equals(), used for membership (in, not-in, array-contains,
+     * array-contains-any, arrayUnion/arrayRemove) and snapshot change checks.
+     * Unlike compare(), numbers are equal only with the same type and bits:
+     * 1 is not 1.0, NaN equals NaN, and -0.0 is not 0.0. Maps, though, are
+     * equal when compare() finds them the same, so {a: 1} equals {a: 1.0}.
+     */
     public static function equals(mixed $a, mixed $b): bool
     {
-        return self::compare($a, $b) === 0;
+        $type = self::typeOrder($a);
+
+        if ($type !== self::typeOrder($b)) {
+            return false;
+        }
+
+        return match ($type) {
+            0 => true,
+            1, 4 => $a === $b,
+            2 => self::numbersEqual(self::number($a), self::number($b)),
+            3 => [(int) $a['seconds'], (int) ($a['nanoseconds'] ?? 0)] === [(int) $b['seconds'], (int) ($b['nanoseconds'] ?? 0)],
+            5 => self::compare($a, $b) === 0,
+            6 => $a['path'] === $b['path'],
+            7 => (float) $a['latitude'] == (float) $b['latitude'] && (float) $a['longitude'] == (float) $b['longitude'],
+            8 => count($a) === count($b) && array_filter(array_map(self::equals(...), array_values($a), array_values($b)), fn (bool $same) => ! $same) === [],
+            default => count(self::entries($a)) === count(self::entries($b)) && self::compare($a, $b) === 0,
+        };
+    }
+
+    public static function isNumber(mixed $value): bool
+    {
+        return self::typeOrder($value) === 2;
     }
 
     /**
-     * @return array<array-key, mixed>
+     * A number's PHP value: int for integers, float for doubles (tagged
+     * NaN and infinities included).
      */
-    private static function entries(mixed $map): array
-    {
-        return $map instanceof stdClass ? get_object_vars($map) : (array) $map;
-    }
-
-    private static function number(mixed $value): float|int
+    public static function number(mixed $value): float|int
     {
         if (self::isTagged($value, 'double')) {
             return match ($value['value']) {
@@ -103,17 +127,95 @@ final class WireValues
         return $value;
     }
 
+    /**
+     * A double in wire form: JSON cannot carry NaN or the infinities.
+     *
+     * @return float|array{__type: string, value: string}
+     */
+    public static function double(float $value): float|array
+    {
+        return match (true) {
+            is_nan($value) => ['__type' => 'double', 'value' => 'NaN'],
+            is_infinite($value) => ['__type' => 'double', 'value' => $value > 0 ? 'Infinity' : '-Infinity'],
+            default => $value,
+        };
+    }
+
+    /**
+     * @return array<array-key, mixed>
+     */
+    private static function entries(mixed $map): array
+    {
+        return $map instanceof stdClass ? get_object_vars($map) : (array) $map;
+    }
+
+    /**
+     * The SDK's CompareNumbers: NaN sorts before every other number, and an
+     * integer and a double compare exactly (no rounding through float).
+     */
     private static function compareNumbers(float|int $a, float|int $b): int
     {
-        // Firestore sorts NaN before every other number.
-        $aNan = is_float($a) && is_nan($a);
-        $bNan = is_float($b) && is_nan($b);
+        if (is_int($a) && is_int($b)) {
+            return $a <=> $b;
+        }
 
-        if ($aNan || $bNan) {
-            return $aNan === $bNan ? 0 : ($aNan ? -1 : 1);
+        if (is_float($a) && is_float($b)) {
+            return self::compareDoubles($a, $b);
+        }
+
+        return is_float($a) ? self::compareMixed($a, $b) : -self::compareMixed($b, $a);
+    }
+
+    private static function compareDoubles(float $a, float $b): int
+    {
+        if (is_nan($a) || is_nan($b)) {
+            return is_nan($a) === is_nan($b) ? 0 : (is_nan($a) ? -1 : 1);
         }
 
         return $a <=> $b;
+    }
+
+    /**
+     * util::CompareMixedNumber.
+     */
+    private static function compareMixed(float $double, int $integer): int
+    {
+        // -2^63 is exact as a double; 2^63 is the first double above PHP_INT_MAX.
+        if ($double < (float) PHP_INT_MIN) {
+            return -1;
+        }
+
+        if ($double >= -(float) PHP_INT_MIN) {
+            return 1;
+        }
+
+        if (is_nan($double)) {
+            return -1;
+        }
+
+        $truncated = (int) $double;
+
+        if ($truncated !== $integer) {
+            return $truncated <=> $integer;
+        }
+
+        return self::compareDoubles($double, (float) $integer);
+    }
+
+    /**
+     * util::DoubleBitwiseEquals for doubles (NaN normalised); integers by value.
+     */
+    private static function numbersEqual(float|int $a, float|int $b): bool
+    {
+        if (is_int($a) || is_int($b)) {
+            return $a === $b;
+        }
+
+        if (is_nan($a) || is_nan($b)) {
+            return is_nan($a) && is_nan($b);
+        }
+
+        return pack('E', $a) === pack('E', $b);
     }
 
     /**

@@ -80,7 +80,10 @@ describe('documents', function () {
         ]);
     });
 
-    it('fails to update a missing document with not-found', function () {
+    it('fails an awaited update of a missing document with not-found', function () {
+        // Only an awaited write sees the server's not-found; see the unawaited case below.
+        Firestore::waitForServer();
+
         try {
             Firestore::doc('users/missing')->update(['a' => 1]);
             $this->fail('Expected a FirestoreException.');
@@ -465,6 +468,8 @@ describe('batches', function () {
 
     it('applies nothing when one write fails', function () {
         Firestore::doc('a/1')->set(['n' => 1]);
+        // Awaited, so the server's not-found surfaces as an exception.
+        Firestore::waitForServer();
 
         expect(fn () => Firestore::batch()
             ->set('a/2', ['n' => 2])
@@ -839,32 +844,152 @@ describe('network and failures', function () {
 });
 
 it('matches arrays holding null with array-contains null, like the native SDKs', function () {
-    \VitisStudio\NativeFirestore\Facades\Firestore::fake();
-    \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->doc('a')->set(['items' => [null]]);
-    \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->doc('b')->set(['items' => [1]]);
+    Firestore::fake();
+    Firestore::collection('t')->doc('a')->set(['items' => [null]]);
+    Firestore::collection('t')->doc('b')->set(['items' => [1]]);
 
-    $ids = array_map(fn ($d) => $d->id(), \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->where('items', 'array-contains', null)->get()->documents());
+    $ids = array_map(fn ($d) => $d->id(), Firestore::collection('t')->where('items', 'array-contains', null)->get()->documents());
 
     expect($ids)->toBe(['a']);
 });
 
 it('rejects range comparisons with null or NaN, like the native bridges', function (string $op, mixed $value) {
-    \VitisStudio\NativeFirestore\Facades\Firestore::fake();
+    Firestore::fake();
 
-    expect(fn () => \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->where('x', $op, $value)->get())
+    expect(fn () => Firestore::collection('t')->where('x', $op, $value)->get())
         ->toThrow(InvalidArgumentException::class, 'null and NaN only support');
 })->with([['<', null], ['<=', null], ['>', NAN], ['>=', NAN]]);
 
 it('applies transforms in a plain set() to the previous values while dropping omitted fields', function () {
-    \VitisStudio\NativeFirestore\Facades\Firestore::fake();
-    $doc = \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->doc('a');
+    Firestore::fake();
+    $doc = Firestore::collection('t')->doc('a');
     $doc->set(['count' => 10, 'tags' => ['a'], 'nested' => ['n' => 1], 'gone' => true]);
 
     $doc->set([
-        'count' => \VitisStudio\NativeFirestore\FieldValue::increment(2),
-        'tags' => \VitisStudio\NativeFirestore\FieldValue::arrayUnion('b'),
-        'nested' => ['n' => \VitisStudio\NativeFirestore\FieldValue::increment(1)],
+        'count' => FieldValue::increment(2),
+        'tags' => FieldValue::arrayUnion('b'),
+        'nested' => ['n' => FieldValue::increment(1)],
     ]);
 
     expect($doc->get()->data())->toBe(['count' => 12, 'tags' => ['a', 'b'], 'nested' => ['n' => 2]]);
+});
+
+describe('SDK fidelity', function () {
+    it('keeps integers and doubles apart in membership filters, as the SDK\'s Equals does', function () {
+        $this->fake->seed('t/a', ['x' => 1, 'tags' => [1]]);
+        $this->fake->seed('t/b', ['x' => 1.0, 'tags' => [1.0]]);
+        $ids = fn ($query) => array_map(fn ($document) => $document->id(), $query->get()->documents());
+        $items = Firestore::collection('t');
+
+        expect($ids($items->where('x', 'in', [1.0])))->toBe(['b'])
+            ->and($ids($items->where('x', 'in', [1])))->toBe(['a'])
+            ->and($ids($items->where('x', 'not-in', [1.0])))->toBe(['a'])
+            ->and($ids($items->where('tags', 'array-contains', 1.0)))->toBe(['b'])
+            ->and($ids($items->where('tags', 'array-contains-any', [1])))->toBe(['a']);
+    });
+
+    it('still matches 1 and 1.0 with == and excludes both with !=, which use Compare', function () {
+        $this->fake->seed('t/a', ['x' => 1]);
+        $this->fake->seed('t/b', ['x' => 1.0]);
+        $this->fake->seed('t/c', ['x' => 2]);
+        $ids = fn ($query) => array_map(fn ($document) => $document->id(), $query->get()->documents());
+
+        expect($ids(Firestore::collection('t')->where('x', '==', 1.0)))->toBe(['a', 'b'])
+            ->and($ids(Firestore::collection('t')->where('x', '!=', 1)))->toBe(['c']);
+    });
+
+    it('treats NaN as equal to NaN and -0.0 as different from 0.0 in membership', function () {
+        $this->fake->seed('t/nan', ['x' => NAN]);
+        $this->fake->seed('t/neg', ['x' => -0.0]);
+        $this->fake->seed('t/pos', ['x' => 0.0]);
+        $ids = fn ($query) => array_map(fn ($document) => $document->id(), $query->get()->documents());
+
+        expect($ids(Firestore::collection('t')->where('x', 'in', [NAN])))->toBe(['nan'])
+            ->and($ids(Firestore::collection('t')->where('x', 'in', [0.0])))->toBe(['pos'])
+            ->and($ids(Firestore::collection('t')->where('x', '==', 0.0)->orderBy('__name__')))->toBe(['neg', 'pos']);
+    });
+
+    it('compares numbers inside maps loosely, as Equals does through CompareMaps', function () {
+        $this->fake->seed('t/a', ['m' => ['n' => 1], 'k' => [['n' => 1]]]);
+        $ids = fn ($query) => array_map(fn ($document) => $document->id(), $query->get()->documents());
+
+        expect($ids(Firestore::collection('t')->where('m', 'in', [['n' => 1.0]])))->toBe(['a'])
+            ->and($ids(Firestore::collection('t')->where('k', 'array-contains', ['n' => 1.0])))->toBe(['a']);
+    });
+
+    it('dedupes arrayUnion and matches arrayRemove with Equals', function () {
+        $this->fake->seed('t/a', ['l' => [1, NAN]]);
+
+        Firestore::doc('t/a')->update(['l' => FieldValue::arrayUnion(1.0, 1, NAN)]);
+        expect($this->fake->document('t/a')['l'])->toHaveCount(3)
+            ->and($this->fake->document('t/a')['l'][2])->toBe(1.0);
+
+        Firestore::doc('t/a')->update(['l' => FieldValue::arrayRemove(1.0, NAN)]);
+        expect($this->fake->document('t/a')['l'])->toBe([1]);
+    });
+
+    it('orders a large integer against a double exactly, like CompareMixedNumber', function () {
+        $this->fake->seed('t/int', ['x' => PHP_INT_MAX]);
+        $this->fake->seed('t/double', ['x' => 9.2233720368547758E18]);
+        $ids = fn ($query) => array_map(fn ($document) => $document->id(), $query->get()->documents());
+
+        expect($ids(Firestore::collection('t')->orderBy('x')))->toBe(['int', 'double'])
+            ->and($ids(Firestore::collection('t')->where('x', '==', 9.2233720368547758E18)))->toBe(['double']);
+    });
+
+    it('saturates integer increments at the int64 limits', function () {
+        $this->fake->seed('t/a', ['max' => PHP_INT_MAX, 'min' => PHP_INT_MIN]);
+
+        Firestore::doc('t/a')->update(['max' => FieldValue::increment(1), 'min' => FieldValue::increment(-1)]);
+
+        expect($this->fake->document('t/a'))->toBe(['max' => PHP_INT_MAX, 'min' => PHP_INT_MIN]);
+    });
+
+    it('uses double arithmetic when either side of an increment is a double', function () {
+        $this->fake->seed('t/a', ['nan' => NAN, 'inf' => INF, 'int' => 1, 'double' => 1.5, 'text' => 'x']);
+
+        Firestore::doc('t/a')->update([
+            'nan' => FieldValue::increment(2),
+            'inf' => FieldValue::increment(2),
+            'int' => FieldValue::increment(0.5),
+            'double' => FieldValue::increment(1),
+            'text' => FieldValue::increment(2),
+            'missing' => FieldValue::increment(2.0),
+        ]);
+        $data = $this->fake->document('t/a');
+
+        expect(is_nan($data['nan']))->toBeTrue()
+            ->and($data['inf'])->toBe(INF)
+            ->and($data['int'])->toBe(1.5)
+            ->and($data['double'])->toBe(2.5)
+            ->and($data['text'])->toBe(2)
+            ->and($data['missing'])->toBe(2.0);
+    });
+
+    it('reports a change from null to false, 0 to "0" and 1 to 1.0 only when Equals differs', function () {
+        Event::fake([QuerySnapshotChanged::class, DocumentChanged::class]);
+        $this->fake->seed('t/a', ['v' => null, 'n' => 1]);
+        Firestore::collection('t')->listen();
+        Firestore::doc('t/a')->listen();
+
+        Firestore::doc('t/a')->update(['v' => false]);
+        Firestore::doc('t/a')->update(['v' => 0]);
+        Firestore::doc('t/a')->update(['v' => '0']);
+        Firestore::doc('t/a')->update(['n' => 1.0]);
+
+        // Initial snapshot plus three real changes; 1 -> 1.0 is no change to the SDK's view.
+        Event::assertDispatchedTimes(QuerySnapshotChanged::class, 4);
+        Event::assertDispatchedTimes(DocumentChanged::class, 4);
+    });
+
+    it('turns an unawaited update of a missing document into a rolled-back batch and WriteFailed', function () {
+        Event::fake([WriteFailed::class]);
+        $this->fake->seed('a/1', ['n' => 1]);
+
+        Firestore::batch()->set('a/2', ['n' => 2])->update('a/missing', ['n' => 3])->commit();
+
+        $this->fake->assertMissing('a/2')->assertMissing('a/missing')->assertExists('a/1', ['n' => 1]);
+        expect($this->fake->commits())->toBe([]);
+        Event::assertDispatched(WriteFailed::class, fn (WriteFailed $event) => $event->code === 'not-found' && $event->paths === ['a/2', 'a/missing']);
+    });
 });

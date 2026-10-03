@@ -63,8 +63,9 @@ class DocumentReference implements JsonSerializable
     }
 
     /**
-     * Update fields of an existing document; fails with not-found when it
-     * does not exist. Keys may be dotted field paths ("address.city").
+     * Update fields of an existing document. On a missing one an awaited
+     * write throws not-found; an unawaited one dispatches WriteFailed. Keys
+     * may be dotted field paths ("address.city").
      *
      * @param  array<string, mixed>  $data
      */

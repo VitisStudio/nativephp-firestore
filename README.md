@@ -198,7 +198,7 @@ $ref = Firestore::doc('users/ada');
 $ref->set(['name' => 'Ada', 'age' => 36]);                // create / overwrite
 $ref->set(['age' => 37], merge: true);                     // deep merge
 $ref->set($data, merge: ['name', 'address.city']);         // merge only these fields
-$ref->update(['age' => 38, 'address.city' => 'London']);   // fails with not-found if missing
+$ref->update(['age' => 38, 'address.city' => 'London']);   // not-found if missing: thrown when awaited, else a WriteFailed event
 $ref->delete();
 
 Firestore::collection('users')->add(['name' => 'Grace']); // auto id, returns the DocumentReference

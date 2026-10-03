@@ -262,7 +262,9 @@ class FakeFirestore implements FirestoreDriver
     /**
      * A commit that waits for the server needs it: offline it fails with
      * unavailable and changes nothing (on a device the call times out
-     * instead, with the writes still queued locally).
+     * instead, with the writes still queued locally). An update() of a
+     * missing document throws not-found when awaited; otherwise the batch is
+     * applied locally without it, then rolled back with a WriteFailed event.
      */
     public function commitWrites(array $writes, bool $waitForServer): void
     {
@@ -285,9 +287,23 @@ class FakeFirestore implements FirestoreDriver
 
         $documents = $this->documents;
         $versions = $this->versions;
+        $preconditionFailure = null;
 
         foreach ($typed as $index => $write) {
-            $documents = $this->applyWrite($documents, $paths[$index], $write);
+            try {
+                $documents = $this->applyWrite($documents, $paths[$index], $write);
+            } catch (FirestoreException $exception) {
+                if ($waitForServer || ! $exception->isNotFound()) {
+                    throw $exception;
+                }
+
+                // Unawaited, the SDK treats an update of a missing document as a
+                // local no-op; the server then refuses the whole batch.
+                $preconditionFailure ??= ['code' => $exception->errorCode(), 'message' => $exception->getMessage()];
+
+                continue;
+            }
+
             $versions[$paths[$index]] = ($versions[$paths[$index]] ?? 0) + 1;
         }
 
@@ -298,13 +314,13 @@ class FakeFirestore implements FirestoreDriver
 
         $this->notifyListeners();
 
-        if (! $waitForServer && $rejection = array_shift($this->rejections)) {
+        if (! $waitForServer && $rejection = $preconditionFailure ?? array_shift($this->rejections)) {
             // The server refused a write that was only applied locally.
             array_pop($this->commits);
             $this->documents = $before;
 
             foreach ($paths as $path) {
-                $this->versions[$path]++;
+                $this->versions[$path] = ($this->versions[$path] ?? 0) + 1;
             }
 
             $this->notifyListeners();
@@ -567,7 +583,7 @@ class FakeFirestore implements FirestoreDriver
         if ($this->isSentinel($value)) {
             return match ($value['op']) {
                 'serverTimestamp' => Timestamp::now()->toWire(),
-                'increment' => (is_int($current) || is_float($current) ? $current : 0) + $value['value'],
+                'increment' => $this->increment($current, $value['value']),
                 'arrayUnion' => $this->arrayUnion(WireValues::isList($current) ? $current : [], $value['value']),
                 'arrayRemove' => array_values(array_filter(
                     WireValues::isList($current) ? $current : [],
@@ -590,6 +606,27 @@ class FakeFirestore implements FirestoreDriver
         }
 
         return $value;
+    }
+
+    /**
+     * NumericIncrementTransform: a non-number counts as integer 0; two
+     * integers add with saturation at the int64 limits; anything involving
+     * a double is double arithmetic, so NaN and the infinities carry through.
+     */
+    private function increment(mixed $current, mixed $operand): mixed
+    {
+        $base = WireValues::isNumber($current) ? WireValues::number($current) : 0;
+        $operand = WireValues::number($operand);
+
+        if (is_int($base) && is_int($operand)) {
+            return match (true) {
+                $base > 0 && $operand > PHP_INT_MAX - $base => PHP_INT_MAX,
+                $base < 0 && $operand < PHP_INT_MIN - $base => PHP_INT_MIN,
+                default => $base + $operand,
+            };
+        }
+
+        return WireValues::double((float) $base + (float) $operand);
     }
 
     /**
@@ -769,9 +806,11 @@ class FakeFirestore implements FirestoreDriver
             return false;
         }
 
+        // ==, != and the range operators use the SDK's Compare (1 == 1.0, NaN == NaN,
+        // -0.0 == 0.0); the membership operators use its stricter Equals.
         return match ($filter['op']) {
-            '==' => WireValues::equals($value, $operand),
-            '!=' => $value !== null && ! WireValues::equals($value, $operand),
+            '==' => WireValues::compare($value, $operand) === 0,
+            '!=' => $value !== null && WireValues::compare($value, $operand) !== 0,
             '<' => $this->sameType($value, $operand) && WireValues::compare($value, $operand) < 0,
             '<=' => $this->sameType($value, $operand) && WireValues::compare($value, $operand) <= 0,
             '>' => $this->sameType($value, $operand) && WireValues::compare($value, $operand) > 0,
@@ -949,10 +988,15 @@ class FakeFirestore implements FirestoreDriver
         $target = $listener['target'];
 
         if ($target['type'] === 'document') {
-            $snapshot = $this->documentSnapshot(Path::document($target['path']));
-            $state = [$snapshot['exists'], $snapshot['data']];
+            $path = Path::document($target['path']);
+            $snapshot = $this->documentSnapshot($path);
+            $state = $this->documents[$path] ?? false;
 
-            if ($listener['last'] !== null && $listener['last'] == $state) {
+            // Like the SDK's view, a document only changes when its stored data is
+            // no longer Equals() to the last version seen.
+            if ($listener['last'] !== null && ($state === false || $listener['last'] === false
+                ? $state === $listener['last']
+                : WireValues::equals($listener['last'], $state))) {
                 return;
             }
 
@@ -1017,7 +1061,7 @@ class FakeFirestore implements FirestoreDriver
         $added = array_values(array_filter($new, fn (array $document) => ! isset($oldByPath[$document['path']])));
         $modified = array_values(array_filter(
             $new,
-            fn (array $document) => isset($oldByPath[$document['path']]) && $oldByPath[$document['path']]['data'] != $document['data'],
+            fn (array $document) => isset($oldByPath[$document['path']]) && ! WireValues::equals($oldData[$document['path']] ?? null, $this->documents[$document['path']]),
         ));
 
         /** @var list<array{path: string, data: stdClass}> $tracker */
