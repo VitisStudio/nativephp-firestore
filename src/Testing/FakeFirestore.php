@@ -477,7 +477,10 @@ class FakeFirestore implements FirestoreDriver
                 } elseif (! empty($write['merge'])) {
                     $documents[$path] = $this->mergeMap($existing ?? new stdClass, $data);
                 } else {
-                    $documents[$path] = $this->resolveMap(new stdClass, $data, allowDelete: false);
+                    // An overwrite keeps only the written fields, but transforms (increment,
+                    // arrayUnion, ...) still apply to the previous values, as the SDK's
+                    // SetMutation does; resolveMap builds the result from $data's keys only.
+                    $documents[$path] = $this->resolveMap($existing ?? new stdClass, $data, allowDelete: false);
                 }
 
                 return $documents;

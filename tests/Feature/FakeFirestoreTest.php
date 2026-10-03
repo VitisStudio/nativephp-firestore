@@ -854,3 +854,17 @@ it('rejects range comparisons with null or NaN, like the native bridges', functi
     expect(fn () => \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->where('x', $op, $value)->get())
         ->toThrow(InvalidArgumentException::class, 'null and NaN only support');
 })->with([['<', null], ['<=', null], ['>', NAN], ['>=', NAN]]);
+
+it('applies transforms in a plain set() to the previous values while dropping omitted fields', function () {
+    \VitisStudio\NativeFirestore\Facades\Firestore::fake();
+    $doc = \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->doc('a');
+    $doc->set(['count' => 10, 'tags' => ['a'], 'nested' => ['n' => 1], 'gone' => true]);
+
+    $doc->set([
+        'count' => \VitisStudio\NativeFirestore\FieldValue::increment(2),
+        'tags' => \VitisStudio\NativeFirestore\FieldValue::arrayUnion('b'),
+        'nested' => ['n' => \VitisStudio\NativeFirestore\FieldValue::increment(1)],
+    ]);
+
+    expect($doc->get()->data())->toBe(['count' => 12, 'tags' => ['a', 'b'], 'nested' => ['n' => 2]]);
+});
