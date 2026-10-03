@@ -2,6 +2,7 @@
 
 use VitisStudio\NativeFirestore\DTO\DocumentSnapshot;
 use VitisStudio\NativeFirestore\Facades\Firestore;
+use VitisStudio\NativeFirestore\FieldValue;
 use VitisStudio\NativeFirestore\Query\Filter;
 
 it('builds the wire form of a query', function () {
@@ -144,4 +145,10 @@ it('rejects filter combinations the native SDKs refuse', function (Closure $buil
 it('allows maps in array-contains-any and arrays in in()', function () {
     expect(Firestore::collection('c')->whereArrayContainsAny('a', [['k' => 1]])->toWire()['filters'])->toHaveCount(1)
         ->and(Firestore::collection('c')->whereIn('a', [[1, 2]])->toWire()['filters'])->toHaveCount(1);
+});
+
+it('rejects sentinels as filter and cursor values', function () {
+    expect(fn () => Firestore::collection('c')->where('a', '==', FieldValue::serverTimestamp())->toWire())->toThrow(InvalidArgumentException::class)
+        ->and(fn () => Firestore::collection('c')->whereIn('a', [['k' => FieldValue::delete()]])->toWire())->toThrow(InvalidArgumentException::class)
+        ->and(fn () => Firestore::collection('c')->orderBy('a')->startAt(FieldValue::increment(1))->toWire())->toThrow(InvalidArgumentException::class);
 });

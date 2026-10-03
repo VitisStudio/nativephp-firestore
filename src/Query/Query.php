@@ -248,7 +248,7 @@ class Query
             $cursor = ['document' => $values[0]->path, 'inclusive' => $inclusive];
             $snapshot = $values[0];
         } else {
-            $cursor = ['values' => array_map(ValueCodec::encode(...), array_values($values)), 'inclusive' => $inclusive];
+            $cursor = ['values' => array_map(ValueCodec::encodeArgument(...), array_values($values)), 'inclusive' => $inclusive];
             $snapshot = null;
         }
 

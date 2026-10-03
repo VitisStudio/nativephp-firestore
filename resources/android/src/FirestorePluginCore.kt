@@ -425,11 +425,25 @@ internal object NfsPaths {
 
     fun fieldPath(field: String): FieldPath =
         if (field == "__name__") FieldPath.documentId() else FieldPath.of(*fieldSegments(field).toTypedArray())
+
+    /** Firestore reserves field names that begin and end with "__". */
+    fun guardWritableName(name: String) {
+        if (name.length >= 2 && name.startsWith("__") && name.endsWith("__")) {
+            throw NfsErrors.invalid("Field name [$name] is reserved: Firestore field names cannot begin and end with \"__\".")
+        }
+    }
 }
 
 // MARK: - Codec
 
-internal enum class NfsContext { SET, MERGE, UPDATE, QUERY }
+internal enum class NfsContext {
+    SET, MERGE, UPDATE, QUERY;
+
+    val isWrite: Boolean get() = this != QUERY
+}
+
+/** The range Firestore timestamps cover: 0001-01-01T00:00:00Z .. 9999-12-31T23:59:59Z. */
+internal val NFS_TIMESTAMP_SECONDS_RANGE = -62_135_596_800L..253_402_300_799L
 
 internal object NfsCodec {
     fun taggedDouble(value: Double): Map<String, Any?> = mapOf(
@@ -441,7 +455,9 @@ internal object NfsCodec {
         },
     )
 
-    fun decode(value: Any?, db: FirebaseFirestore, context: NfsContext, depth: Int = 0, inArray: Boolean = false): Any? {
+    // `inArray`: the direct parent is an array (nested arrays are illegal).
+    // `underArray`: any ancestor is an array (sentinels are illegal); survives maps.
+    fun decode(value: Any?, db: FirebaseFirestore, context: NfsContext, depth: Int = 0, inArray: Boolean = false, underArray: Boolean = false): Any? {
         if (depth >= 20) throw NfsErrors.invalid("Data is nested too deeply (Firestore allows 20 levels).")
 
         return when (value) {
@@ -450,18 +466,19 @@ internal object NfsCodec {
             is Number -> if (value is Float) value.toDouble() else value.toLong()
             is List<*> -> {
                 if (inArray) throw NfsErrors.invalid("Firestore does not support arrays directly inside arrays.")
-                value.map { decode(it, db, context, depth + 1, inArray = true) }
+                value.map { decode(it, db, context, depth + 1, inArray = true, underArray = true) }
             }
             is Map<*, *> -> {
                 val type = value["__type"] as? String
                 if (type != null) {
-                    decodeTagged(type, value, db, context, depth, inArray)
+                    decodeTagged(type, value, db, context, depth, underArray || inArray)
                 } else {
                     val result = LinkedHashMap<String, Any?>()
                     for ((key, child) in value) {
                         val name = key.toString()
                         if (name.isEmpty()) throw NfsErrors.invalid("Document field names cannot be empty.")
-                        result[name] = decode(child, db, context, depth + 1)
+                        if (context.isWrite) NfsPaths.guardWritableName(name)
+                        result[name] = decode(child, db, context, depth + 1, underArray = underArray || inArray)
                     }
                     result
                 }
@@ -477,17 +494,25 @@ internal object NfsCodec {
         return decode(value, db, context) as? Map<String, Any?> ?: throw NfsErrors.invalid("Document data must be a map.")
     }
 
-    private fun decodeTagged(type: String, map: Map<*, *>, db: FirebaseFirestore, context: NfsContext, depth: Int, inArray: Boolean): Any? {
+    private fun decodeTagged(type: String, map: Map<*, *>, db: FirebaseFirestore, context: NfsContext, depth: Int, underArray: Boolean): Any? {
         return when (type) {
             "timestamp" -> {
-                val nanos = (map["nanoseconds"] as? Number)?.toInt() ?: 0
-                if (nanos !in 0..999_999_999) throw NfsErrors.invalid("Timestamp nanoseconds out of range.")
-                Timestamp((map["seconds"] as? Number)?.toLong() ?: 0L, nanos)
+                val seconds = map["seconds"] as? Number
+                if (seconds == null || seconds.toDouble() !in -62_135_596_800.0..253_402_300_799.0 || seconds.toLong() !in NFS_TIMESTAMP_SECONDS_RANGE) {
+                    throw NfsErrors.invalid("Timestamp seconds must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z.")
+                }
+                val nanos = (map["nanoseconds"] as? Number)?.toLong() ?: 0L
+                if (nanos !in 0L..999_999_999L) throw NfsErrors.invalid("Timestamp nanoseconds out of range.")
+                Timestamp(seconds.toLong(), nanos.toInt())
             }
-            "geopoint" -> GeoPoint(
-                (map["latitude"] as? Number)?.toDouble() ?: 0.0,
-                (map["longitude"] as? Number)?.toDouble() ?: 0.0,
-            )
+            "geopoint" -> {
+                val latitude = (map["latitude"] as? Number)?.toDouble() ?: 0.0
+                val longitude = (map["longitude"] as? Number)?.toDouble() ?: 0.0
+                if (latitude !in -90.0..90.0 || longitude !in -180.0..180.0) {
+                    throw NfsErrors.invalid("GeoPoint coordinates out of range.")
+                }
+                GeoPoint(latitude, longitude)
+            }
             "reference" -> NfsPaths.document(map["path"] as? String ?: "", db)
             "bytes" -> Blob.fromBytes(Base64.decode(map["base64"] as? String ?: "", Base64.DEFAULT))
             "double" -> when (map["value"]) {
@@ -496,15 +521,18 @@ internal object NfsCodec {
                 "-Infinity" -> Double.NEGATIVE_INFINITY
                 else -> (map["value"] as? Number)?.toDouble() ?: Double.NaN
             }
-            "fieldvalue" -> decodeSentinel(map, db, context, depth, inArray)
-            else -> map.entries.associate { it.key.toString() to decode(it.value, db, context, depth + 1) }
+            "fieldvalue" -> decodeSentinel(map, db, context, depth, underArray)
+            else -> map.entries.associate {
+                if (context.isWrite) NfsPaths.guardWritableName(it.key.toString())
+                it.key.toString() to decode(it.value, db, context, depth + 1, underArray = underArray)
+            }
         }
     }
 
-    private fun decodeSentinel(map: Map<*, *>, db: FirebaseFirestore, context: NfsContext, depth: Int, inArray: Boolean): FieldValue {
+    private fun decodeSentinel(map: Map<*, *>, db: FirebaseFirestore, context: NfsContext, depth: Int, underArray: Boolean): FieldValue {
         val op = map["op"] as? String ?: ""
         if (context == NfsContext.QUERY) throw NfsErrors.invalid("FieldValue.$op() cannot be used in a query.")
-        if (inArray) throw NfsErrors.invalid("FieldValue.$op() cannot be used inside an array.")
+        if (underArray) throw NfsErrors.invalid("FieldValue.$op() cannot be used inside an array.")
 
         return when (op) {
             "serverTimestamp" -> FieldValue.serverTimestamp()
@@ -516,7 +544,7 @@ internal object NfsCodec {
             }
             "arrayUnion", "arrayRemove" -> {
                 val elements = ((map["value"] as? List<*>) ?: emptyList<Any?>())
-                    .map { decode(it, db, NfsContext.QUERY, depth + 1, inArray = true) }
+                    .map { decode(it, db, NfsContext.QUERY, depth + 1, inArray = true, underArray = true) }
                     .toTypedArray()
                 if (op == "arrayUnion") FieldValue.arrayUnion(*elements) else FieldValue.arrayRemove(*elements)
             }
@@ -860,7 +888,7 @@ internal sealed class NfsWrite(val ref: DocumentReference) {
                     if (raw.isNullOrEmpty()) throw NfsErrors.invalid("update() needs at least one field.")
                     val data = LinkedHashMap<String, Any?>()
                     for ((field, value) in raw) {
-                        NfsPaths.fieldSegments(field)
+                        NfsPaths.fieldSegments(field).forEach { NfsPaths.guardWritableName(it) }
                         data[field] = NfsCodec.decode(value, db, NfsContext.UPDATE, depth = 1)
                     }
                     Update(ref, data)

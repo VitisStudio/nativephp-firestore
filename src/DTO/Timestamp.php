@@ -14,12 +14,22 @@ use Stringable;
  */
 final class Timestamp implements JsonSerializable, Stringable
 {
+    /** 0001-01-01T00:00:00Z, the earliest instant Firestore can store. */
+    public const MIN_SECONDS = -62_135_596_800;
+
+    /** 9999-12-31T23:59:59Z, the latest whole second Firestore can store. */
+    public const MAX_SECONDS = 253_402_300_799;
+
     public function __construct(
         public readonly int $seconds,
         public readonly int $nanoseconds = 0,
     ) {
         if ($nanoseconds < 0 || $nanoseconds > 999_999_999) {
             throw new InvalidArgumentException('Timestamp nanoseconds must be between 0 and 999,999,999.');
+        }
+
+        if ($seconds < self::MIN_SECONDS || $seconds > self::MAX_SECONDS) {
+            throw new InvalidArgumentException('Timestamp seconds must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z.');
         }
     }
 

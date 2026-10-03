@@ -92,3 +92,73 @@ it('round-trips timestamps through milliseconds and DateTime', function () {
         ->and($timestamp->toMilliseconds())->toBe(-1)
         ->and((string) new Timestamp(0, 1_500))->toBe('1970-01-01T00:00:00.000001Z');
 });
+
+it('accepts timestamps at the edges of the range Firestore stores', function () {
+    expect((string) new Timestamp(Timestamp::MIN_SECONDS))->toBe('0001-01-01T00:00:00.000000Z')
+        ->and((string) new Timestamp(Timestamp::MAX_SECONDS, 999_999_999))->toBe('9999-12-31T23:59:59.999999Z');
+});
+
+it('rejects timestamps outside the range Firestore stores', function (Closure $make) {
+    expect($make)->toThrow(InvalidArgumentException::class, '0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z');
+})->with([
+    'one second past the max' => [fn () => new Timestamp(Timestamp::MAX_SECONDS + 1)],
+    'one second before the min' => [fn () => new Timestamp(Timestamp::MIN_SECONDS - 1)],
+    'year 10000 DateTime' => [fn () => Timestamp::fromDateTime((new DateTimeImmutable('9999-12-31T23:59:59Z'))->modify('+1 second'))],
+    'huge milliseconds' => [fn () => Timestamp::fromMilliseconds(PHP_INT_MAX)],
+    'DateTime encoded as a value' => [fn () => ValueCodec::encode(new DateTimeImmutable('0000-06-01T00:00:00Z'))],
+]);
+
+it('rejects NaN GeoPoint coordinates', function () {
+    expect(fn () => new GeoPoint(NAN, 0))->toThrow(InvalidArgumentException::class)
+        ->and(fn () => new GeoPoint(0, NAN))->toThrow(InvalidArgumentException::class);
+});
+
+it('rejects sentinels anywhere beneath an array, at any depth', function (mixed $value) {
+    expect(fn () => ValueCodec::encodeMap(['field' => $value]))->toThrow(InvalidArgumentException::class, 'inside an array');
+})->with([
+    'directly' => [[FieldValue::serverTimestamp()]],
+    'in a map in an array' => [[['at' => FieldValue::serverTimestamp()]]],
+    'deep in maps in an array' => [[['a' => ['b' => ['c' => FieldValue::increment(1)]]]]],
+    'arrayUnion in a map in an array' => [[['tags' => FieldValue::arrayUnion('x')]]],
+    'arrayRemove in a map in an array' => [[['tags' => FieldValue::arrayRemove('x')]]],
+    'delete in a map in an array' => [[['gone' => FieldValue::delete()]]],
+    'stdClass in an array' => [[(object) ['at' => FieldValue::serverTimestamp()]]],
+]);
+
+it('rejects sentinels inside arrayUnion/arrayRemove elements, however deep', function () {
+    expect(fn () => ValueCodec::encode(FieldValue::arrayUnion(['at' => FieldValue::serverTimestamp()])))->toThrow(InvalidArgumentException::class)
+        ->and(fn () => FieldValue::arrayRemove(FieldValue::increment(1))->toWire())->toThrow(InvalidArgumentException::class)
+        ->and(fn () => ValueCodec::encode(FieldValue::arrayUnion([1, 2])))->toThrow(InvalidArgumentException::class, 'arrays directly inside arrays');
+});
+
+it('rejects arrays directly inside arrays but allows them under maps', function () {
+    expect(fn () => ValueCodec::encode([[1, 2]]))->toThrow(InvalidArgumentException::class, 'arrays directly inside arrays')
+        ->and(ValueCodec::json(ValueCodec::encode([['xs' => [1, 2]]])))->toBe('[{"xs":[1,2]}]');
+});
+
+it('enforces where delete() may appear in writes', function () {
+    expect(fn () => ValueCodec::encodeSetData(['x' => FieldValue::delete()], merge: false))->toThrow(InvalidArgumentException::class)
+        ->and(fn () => ValueCodec::encodeSetData(['m' => ['x' => FieldValue::delete()]], merge: false))->toThrow(InvalidArgumentException::class)
+        ->and((array) ValueCodec::encodeSetData(['m' => ['x' => FieldValue::delete()]], merge: true))->toHaveKey('m')
+        ->and((array) ValueCodec::encodeUpdateData(['m.x' => FieldValue::delete()]))->toHaveKey('m.x')
+        ->and(fn () => ValueCodec::encodeUpdateData(['m' => ['x' => FieldValue::delete()]]))->toThrow(InvalidArgumentException::class, 'top level');
+});
+
+it('rejects reserved field names in writes but not in query operands', function () {
+    expect(fn () => ValueCodec::encodeSetData(['__x__' => 1], merge: false))->toThrow(InvalidArgumentException::class, 'reserved')
+        ->and(fn () => ValueCodec::encodeSetData(['list' => [['__x__' => 1]]], merge: true))->toThrow(InvalidArgumentException::class, 'reserved')
+        ->and(fn () => ValueCodec::encodeUpdateData(['a.__name__' => 1]))->toThrow(InvalidArgumentException::class, 'reserved')
+        ->and((array) ValueCodec::encodeArgument(['__x__' => 1]))->toBe(['__x__' => 1])
+        ->and((array) ValueCodec::encodeSetData(['__x' => 1, 'x__' => 2], merge: false))->toBe(['__x' => 1, 'x__' => 2]);
+});
+
+it('rejects data nested deeper than Firestore allows', function () {
+    $nest = fn (int $levels) => array_reduce(range(1, $levels), fn ($carry) => ['m' => $carry], 1);
+
+    expect(ValueCodec::encodeMap($nest(19)))->toBeInstanceOf(stdClass::class)
+        ->and(fn () => ValueCodec::encodeMap($nest(20)))->toThrow(InvalidArgumentException::class, 'nested too deeply');
+});
+
+it('rejects sentinels in query operands', function () {
+    expect(fn () => ValueCodec::encodeArgument(FieldValue::serverTimestamp()))->toThrow(InvalidArgumentException::class, 'cannot be used in a query');
+});

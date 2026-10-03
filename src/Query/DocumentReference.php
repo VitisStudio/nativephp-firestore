@@ -118,11 +118,15 @@ class DocumentReference implements JsonSerializable
      */
     public static function setWrite(string $path, array $data, bool|array $merge = false): array
     {
-        $write = ['type' => 'set', 'path' => $path, 'data' => ValueCodec::encodeMap($data), 'merge' => $merge === true];
+        $write = ['type' => 'set', 'path' => $path, 'data' => ValueCodec::encodeSetData($data, $merge !== false), 'merge' => $merge === true];
 
         if (is_array($merge)) {
             if ($merge === [] || ! array_is_list($merge)) {
                 throw new InvalidArgumentException('Merge fields must be a non-empty list of field paths.');
+            }
+
+            foreach ($merge as $field) {
+                Path::fieldSegments((string) $field);
             }
 
             $write['mergeFields'] = array_values($merge);
@@ -141,7 +145,7 @@ class DocumentReference implements JsonSerializable
             throw new InvalidArgumentException('update() needs at least one field.');
         }
 
-        return ['type' => 'update', 'path' => $path, 'data' => ValueCodec::encodeMap($data)];
+        return ['type' => 'update', 'path' => $path, 'data' => ValueCodec::encodeUpdateData($data)];
     }
 
     /**

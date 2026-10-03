@@ -149,7 +149,42 @@ describe('field values', function () {
 
     it('rejects delete() in a plain set', function () {
         expect(fn () => Firestore::doc('a/b')->set(['x' => FieldValue::delete()]))
-            ->toThrow(FirestoreException::class);
+            ->toThrow(InvalidArgumentException::class, 'update() or set() with merge');
+    });
+
+    it('rejects sentinels anywhere beneath an array before they reach the driver', function (Closure $write) {
+        expect($write)->toThrow(InvalidArgumentException::class, 'inside an array');
+
+        expect($this->fake->commits())->toBe([]);
+    })->with([
+        'serverTimestamp in a map in an array' => [fn () => Firestore::doc('a/b')->set(['items' => [['at' => FieldValue::serverTimestamp()]]])],
+        'increment deep under an array' => [fn () => Firestore::doc('a/b')->set(['items' => [['x' => ['y' => FieldValue::increment(1)]]]])],
+        'arrayUnion in an array (update)' => [fn () => Firestore::doc('a/b')->update(['items' => [['tags' => FieldValue::arrayUnion('a')]]])],
+        'delete in an array (merge)' => [fn () => Firestore::doc('a/b')->set(['items' => [['x' => FieldValue::delete()]]], merge: true)],
+        'in a batch' => [fn () => Firestore::batch()->set(Firestore::doc('a/b'), ['items' => [['at' => FieldValue::serverTimestamp()]]])],
+    ]);
+
+    it('rejects delete() nested below the top level of update() data', function () {
+        expect(fn () => Firestore::doc('a/b')->update(['meta' => ['x' => FieldValue::delete()]]))
+            ->toThrow(InvalidArgumentException::class, 'top level of update()');
+    });
+
+    it('rejects reserved field names and invalid update paths in writes', function (Closure $write, string $message) {
+        expect($write)->toThrow(InvalidArgumentException::class, $message);
+    })->with([
+        'reserved name in set' => [fn () => Firestore::doc('a/b')->set(['meta' => ['__secret__' => 1]]), 'reserved'],
+        'reserved segment in update path' => [fn () => Firestore::doc('a/b')->update(['meta.__x__' => 1]), 'reserved'],
+        'empty update path segment' => [fn () => Firestore::doc('a/b')->update(['meta..x' => 1]), 'Invalid field path'],
+        'reserved character in update path' => [fn () => Firestore::doc('a/b')->update(['meta/x' => 1]), 'reserved character'],
+        'invalid merge field' => [fn () => Firestore::doc('a/b')->set(['a' => 1], merge: ['a[0]']), 'reserved character'],
+        'empty field name' => [fn () => Firestore::doc('a/b')->set(['' => 1]), 'cannot be empty'],
+        'array directly in array' => [fn () => Firestore::doc('a/b')->set(['grid' => [[1, 2]]]), 'arrays directly inside arrays'],
+    ]);
+
+    it('still allows arrays of maps holding arrays and plain values', function () {
+        Firestore::doc('a/b')->set(['items' => [['tags' => ['x', 'y'], 'at' => new Timestamp(1)]]]);
+
+        expect(Firestore::doc('a/b')->get()->get('items.0.tags'))->toBe(['x', 'y']);
     });
 
     it('accepts delete() in a merge set', function () {

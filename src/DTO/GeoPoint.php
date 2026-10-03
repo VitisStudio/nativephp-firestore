@@ -11,11 +11,11 @@ final class GeoPoint implements JsonSerializable
         public readonly float $latitude,
         public readonly float $longitude,
     ) {
-        if ($latitude < -90 || $latitude > 90) {
+        if (is_nan($latitude) || $latitude < -90 || $latitude > 90) {
             throw new InvalidArgumentException('GeoPoint latitude must be between -90 and 90.');
         }
 
-        if ($longitude < -180 || $longitude > 180) {
+        if (is_nan($longitude) || $longitude < -180 || $longitude > 180) {
             throw new InvalidArgumentException('GeoPoint longitude must be between -180 and 180.');
         }
     }

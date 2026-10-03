@@ -83,7 +83,20 @@ final class Filter
             ];
         }
 
-        return ['field' => $this->field, 'op' => $this->operator, 'value' => ValueCodec::encode($this->value)];
+        return ['field' => $this->field, 'op' => $this->operator, 'value' => $this->encodedValue()];
+    }
+
+    /**
+     * List operators carry one operand per element, so each element is
+     * encoded on its own (an in() element may itself be an array).
+     */
+    private function encodedValue(): mixed
+    {
+        if (in_array($this->operator, ['in', 'not-in', 'array-contains-any'], true) && is_array($this->value) && array_is_list($this->value)) {
+            return array_map(ValueCodec::encodeArgument(...), $this->value);
+        }
+
+        return ValueCodec::encodeArgument($this->value);
     }
 
     /**

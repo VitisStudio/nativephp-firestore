@@ -65,6 +65,27 @@ final class Path
         return $collectionId;
     }
 
+    /**
+     * Split a dotted field path, rejecting what the Firebase SDKs raise on:
+     * empty segments and the characters ~ * / [ ].
+     *
+     * @return list<string>
+     */
+    public static function fieldSegments(string $field): array
+    {
+        $segments = explode('.', $field);
+
+        if ($field === '' || in_array('', $segments, true)) {
+            throw new InvalidArgumentException("Invalid field path [{$field}].");
+        }
+
+        if (strpbrk($field, '~*/[]') !== false) {
+            throw new InvalidArgumentException("Field path [{$field}] contains a reserved character (~ * / [ ]).");
+        }
+
+        return $segments;
+    }
+
     public static function parent(string $path): ?string
     {
         $segments = self::segments($path);

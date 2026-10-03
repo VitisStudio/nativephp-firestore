@@ -218,7 +218,9 @@ Firestore::collection('users')->add(['name' => 'Grace']); // auto id, returns th
 | `DTO\Bytes` | bytes |
 | `NAN`, `INF` | NaN / Infinity |
 
-`FieldValue::serverTimestamp()`, `FieldValue::increment(1)`, `FieldValue::arrayUnion(...)`, `FieldValue::arrayRemove(...)` and `FieldValue::delete()` (in `update()` or a merge `set()` only) work anywhere a value goes. The field name `__type` is reserved by the plugin's wire format.
+`FieldValue::serverTimestamp()`, `FieldValue::increment(1)`, `FieldValue::arrayUnion(...)`, `FieldValue::arrayRemove(...)` and `FieldValue::delete()` work as field values in writes, but not anywhere beneath an array (even inside a map inside an array), not inside `arrayUnion`/`arrayRemove` elements, and not in queries. `FieldValue::delete()` is only allowed in a merge `set()` or as a top-level `update()` value.
+
+The plugin enforces the rest of Firestore's write rules in PHP, throwing `InvalidArgumentException` before anything reaches the native SDK (where the iOS SDK would raise an uncatchable exception): timestamps must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z, arrays cannot sit directly inside arrays, data can nest at most 20 levels, field names cannot be empty or begin and end with `__`, and `update()`/merge field paths cannot contain empty segments or `~ * / [ ]`. The field name `__type` is reserved by the plugin's wire format.
 
 ## Realtime listeners
 

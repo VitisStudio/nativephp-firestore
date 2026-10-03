@@ -2,7 +2,6 @@
 
 namespace VitisStudio\NativeFirestore;
 
-use InvalidArgumentException;
 use VitisStudio\NativeFirestore\Support\ValueCodec;
 
 /**
@@ -55,22 +54,6 @@ final class FieldValue
      */
     public function toWire(): array
     {
-        $wire = ['__type' => 'fieldvalue', 'op' => $this->operation];
-
-        if ($this->operation === self::INCREMENT) {
-            $wire['value'] = $this->value;
-        }
-
-        if ($this->operation === self::ARRAY_UNION || $this->operation === self::ARRAY_REMOVE) {
-            $wire['value'] = array_map(function (mixed $element) {
-                if ($element instanceof self) {
-                    throw new InvalidArgumentException('FieldValue sentinels cannot be nested inside arrayUnion/arrayRemove.');
-                }
-
-                return ValueCodec::encode($element);
-            }, $this->value);
-        }
-
-        return $wire;
+        return ValueCodec::encode($this);
     }
 }

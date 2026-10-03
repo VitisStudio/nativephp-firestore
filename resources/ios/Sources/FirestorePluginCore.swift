@@ -393,6 +393,13 @@ enum NFSPaths {
         }
         return parts
     }
+
+    /// Firestore reserves field names that begin and end with "__"; the SDK raises on them in writes.
+    static func guardWritableName(_ name: String) throws {
+        if name.count >= 2 && name.hasPrefix("__") && name.hasSuffix("__") {
+            throw NFSError.invalid("Field name [\(name)] is reserved: Firestore field names cannot begin and end with \"__\".")
+        }
+    }
 }
 
 // MARK: - Value codec
@@ -403,11 +410,18 @@ enum NFSWriteContext {
     case merge        // set() with merge / mergeFields: delete() anywhere in maps
     case update       // update(): delete() only at top level
     case query        // query operands: no sentinels at all
+
+    var isWrite: Bool { self != .query }
 }
 
+/// The range FIRTimestamp accepts (0001-01-01T00:00:00Z ... 9999-12-31T23:59:59Z); it raises outside it.
+let NFSTimestampSecondsRange: ClosedRange<Int64> = -62_135_596_800...253_402_300_799
+
 enum NFSCodec {
-    // PHP wire value -> Firestore value
-    static func decode(_ value: Any, _ db: Firestore, context: NFSWriteContext, depth: Int = 0, inArray: Bool = false) throws -> Any {
+    // PHP wire value -> Firestore value. `inArray` means the direct parent is an
+    // array (nested arrays are illegal); `underArray` means any ancestor is one
+    // (sentinels are illegal), which survives descending into maps.
+    static func decode(_ value: Any, _ db: Firestore, context: NFSWriteContext, depth: Int = 0, inArray: Bool = false, underArray: Bool = false) throws -> Any {
         guard depth < 20 else {
             throw NFSError.invalid("Data is nested too deeply (Firestore allows 20 levels).")
         }
@@ -428,7 +442,7 @@ enum NFSCodec {
             if inArray {
                 throw NFSError.invalid("Firestore does not support arrays directly inside arrays.")
             }
-            return try list.map { try decode($0, db, context: context, depth: depth + 1, inArray: true) }
+            return try list.map { try decode($0, db, context: context, depth: depth + 1, inArray: true, underArray: true) }
         }
 
         guard let map = value as? [String: Any] else {
@@ -436,7 +450,7 @@ enum NFSCodec {
         }
 
         if let type = map["__type"] as? String {
-            return try decodeTagged(type, map, db, context: context, depth: depth, inArray: inArray)
+            return try decodeTagged(type, map, db, context: context, depth: depth, underArray: underArray || inArray)
         }
 
         var result: [String: Any] = [:]
@@ -444,7 +458,10 @@ enum NFSCodec {
             guard !key.isEmpty else {
                 throw NFSError.invalid("Document field names cannot be empty.")
             }
-            result[key] = try decode(child, db, context: context, depth: depth + 1)
+            if context.isWrite {
+                try NFSPaths.guardWritableName(key)
+            }
+            result[key] = try decode(child, db, context: context, depth: depth + 1, underArray: underArray || inArray)
         }
         return result
     }
@@ -471,15 +488,20 @@ enum NFSCodec {
         return number.int64Value
     }
 
-    private static func decodeTagged(_ type: String, _ map: [String: Any], _ db: Firestore, context: NFSWriteContext, depth: Int, inArray: Bool) throws -> Any {
+    private static func decodeTagged(_ type: String, _ map: [String: Any], _ db: Firestore, context: NFSWriteContext, depth: Int, underArray: Bool) throws -> Any {
         switch type {
         case "timestamp":
-            let seconds = (map["seconds"] as? NSNumber)?.int64Value ?? 0
-            let nanos = (map["nanoseconds"] as? NSNumber)?.int32Value ?? 0
+            guard let secondsNumber = map["seconds"] as? NSNumber,
+                  secondsNumber.doubleValue >= Double(NFSTimestampSecondsRange.lowerBound),
+                  secondsNumber.doubleValue <= Double(NFSTimestampSecondsRange.upperBound),
+                  NFSTimestampSecondsRange.contains(secondsNumber.int64Value) else {
+                throw NFSError.invalid("Timestamp seconds must fall between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z.")
+            }
+            let nanos = (map["nanoseconds"] as? NSNumber)?.int64Value ?? 0
             guard nanos >= 0 && nanos <= 999_999_999 else {
                 throw NFSError.invalid("Timestamp nanoseconds out of range.")
             }
-            return Timestamp(seconds: seconds, nanoseconds: nanos)
+            return Timestamp(seconds: secondsNumber.int64Value, nanoseconds: Int32(nanos))
 
         case "geopoint":
             let latitude = (map["latitude"] as? NSNumber)?.doubleValue ?? 0
@@ -507,24 +529,27 @@ enum NFSCodec {
             }
 
         case "fieldvalue":
-            return try decodeSentinel(map, db, context: context, depth: depth, inArray: inArray)
+            return try decodeSentinel(map, db, context: context, depth: depth, underArray: underArray)
 
         default:
             var result: [String: Any] = [:]
             for (key, child) in map {
-                result[key] = try decode(child, db, context: context, depth: depth + 1)
+                if context.isWrite {
+                    try NFSPaths.guardWritableName(key)
+                }
+                result[key] = try decode(child, db, context: context, depth: depth + 1, underArray: underArray)
             }
             return result
         }
     }
 
-    private static func decodeSentinel(_ map: [String: Any], _ db: Firestore, context: NFSWriteContext, depth: Int, inArray: Bool) throws -> Any {
+    private static func decodeSentinel(_ map: [String: Any], _ db: Firestore, context: NFSWriteContext, depth: Int, underArray: Bool) throws -> Any {
         let op = (map["op"] as? String) ?? ""
 
         if context == .query {
             throw NFSError.invalid("FieldValue.\(op)() cannot be used in a query.")
         }
-        if inArray {
+        if underArray {
             throw NFSError.invalid("FieldValue.\(op)() cannot be used inside an array.")
         }
 
@@ -543,7 +568,7 @@ enum NFSCodec {
             return FieldValue.increment((decoded as? Int64) ?? by.int64Value)
 
         case "arrayUnion", "arrayRemove":
-            let elements = try ((map["value"] as? [Any]) ?? []).map { try decode($0, db, context: .query, depth: depth + 1, inArray: true) }
+            let elements = try ((map["value"] as? [Any]) ?? []).map { try decode($0, db, context: .query, depth: depth + 1, inArray: true, underArray: true) }
             return op == "arrayUnion" ? FieldValue.arrayUnion(elements) : FieldValue.arrayRemove(elements)
 
         case "delete":
@@ -963,7 +988,9 @@ enum NFSWrite {
             }
             var data: [String: Any] = [:]
             for (field, value) in raw {
-                _ = try NFSPaths.fieldSegments(field)
+                for segment in try NFSPaths.fieldSegments(field) {
+                    try NFSPaths.guardWritableName(segment)
+                }
                 data[field] = try NFSCodec.decode(value, db, context: .update, depth: 1)
             }
             return .update(ref, data)
