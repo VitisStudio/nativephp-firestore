@@ -793,8 +793,10 @@ internal object NfsQueryBuilder {
 
         val isListOperator = op in listOf("in", "not-in", "array-contains-any")
         val value = if (isListOperator) null else operand(raw)
-        if (!isListOperator && (value == null || (value is Double && value.isNaN())) && op != "==" && op != "!=") {
-            throw NfsErrors.invalid("null and NaN only support == and != comparisons.")
+        // array-contains null/NaN is valid Firestore (matches arrays holding null/NaN);
+        // only range comparisons are meaningless for them.
+        if (!isListOperator && (value == null || (value is Double && value.isNaN())) && op !in listOf("==", "!=", "array-contains")) {
+            throw NfsErrors.invalid("null and NaN only support ==, != and array-contains comparisons.")
         }
 
         return when (op) {

@@ -907,8 +907,10 @@ enum NFSQueryBuilder {
         if !isListOperator {
             value = try operand(raw)
             let isNullOrNaN = value is NSNull || ((value as? Double)?.isNaN ?? false)
-            if isNullOrNaN && op != "==" && op != "!=" {
-                throw NFSError.invalid("null and NaN only support == and != comparisons.")
+            // array-contains null/NaN is valid Firestore (matches arrays holding null/NaN);
+            // only range comparisons are meaningless for them.
+            if isNullOrNaN && !["==", "!=", "array-contains"].contains(op) {
+                throw NFSError.invalid("null and NaN only support ==, != and array-contains comparisons.")
             }
         }
 

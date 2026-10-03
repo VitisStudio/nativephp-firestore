@@ -117,6 +117,12 @@ final class QueryRules
                 }
             }
 
+            // Same rule as the native bridges: null and NaN only make sense for ==, !=
+            // and array-contains (which matches arrays holding null/NaN).
+            if (in_array($operator, ['<', '<=', '>', '>='], true) && self::isNullOrNaN($filter['value'] ?? null)) {
+                throw new InvalidArgumentException('null and NaN only support ==, != and array-contains comparisons.');
+            }
+
             match ($operator) {
                 'array-contains' => $counts['arrayContains']++,
                 'array-contains-any' => [$counts['arrayContains']++, $counts['disjunctive']++],
@@ -142,6 +148,14 @@ final class QueryRules
         if ($counts['notIn'] > 0 && ($counts['notEqual'] > 0 || $counts['disjunctive'] > 0 || $counts['or'] > 0)) {
             throw new InvalidArgumentException('not-in cannot be combined with !=, in, array-contains-any or OR filters.');
         }
+    }
+
+    /** A wire operand that is null or the tagged NaN double. */
+    private static function isNullOrNaN(mixed $value): bool
+    {
+        return $value === null
+            || (is_float($value) && is_nan($value))
+            || (is_array($value) && ($value['__type'] ?? null) === 'double' && ($value['value'] ?? null) === 'NaN');
     }
 
     /**

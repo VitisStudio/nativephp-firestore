@@ -765,3 +765,20 @@ describe('network and failures', function () {
         expect(Firestore::status())->toMatchArray(['configured' => true, 'fake' => true]);
     });
 });
+
+it('matches arrays holding null with array-contains null, like the native SDKs', function () {
+    \VitisStudio\NativeFirestore\Facades\Firestore::fake();
+    \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->doc('a')->set(['items' => [null]]);
+    \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->doc('b')->set(['items' => [1]]);
+
+    $ids = array_map(fn ($d) => $d->id(), \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->where('items', 'array-contains', null)->get()->documents());
+
+    expect($ids)->toBe(['a']);
+});
+
+it('rejects range comparisons with null or NaN, like the native bridges', function (string $op, mixed $value) {
+    \VitisStudio\NativeFirestore\Facades\Firestore::fake();
+
+    expect(fn () => \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->where('x', $op, $value)->get())
+        ->toThrow(InvalidArgumentException::class, 'null and NaN only support');
+})->with([['<', null], ['<=', null], ['>', NAN], ['>=', NAN]]);
