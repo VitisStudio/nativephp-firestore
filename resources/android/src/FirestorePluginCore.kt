@@ -536,6 +536,19 @@ internal object NfsCodec {
                 }
             }
             "fieldvalue" -> decodeSentinel(map, db, context, depth, underArray)
+            // Our own tag for empty / list-like maps (see the encoder), echoed back by a
+            // snapshot round trip (e.g. the JS wrapper's set(path, snapshot.data)).
+            "map" -> {
+                val entries: Map<*, *> = when (val raw = map["value"]) {
+                    is Map<*, *> -> raw
+                    is List<*> -> if (raw.isEmpty()) emptyMap<String, Any?>() else throw NfsErrors.invalid("Invalid value for a tagged map.")
+                    else -> throw NfsErrors.invalid("Invalid value for a tagged map.")
+                }
+                entries.entries.associate {
+                    if (context.isWrite) NfsPaths.guardWritableName(it.key.toString())
+                    it.key.toString() to decode(it.value, db, context, depth + 1, underArray = underArray)
+                }
+            }
             else -> map.entries.associate {
                 if (context.isWrite) NfsPaths.guardWritableName(it.key.toString())
                 it.key.toString() to decode(it.value, db, context, depth + 1, underArray = underArray)

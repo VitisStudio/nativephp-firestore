@@ -538,6 +538,26 @@ enum NFSCodec {
         case "fieldvalue":
             return try decodeSentinel(map, db, context: context, depth: depth, underArray: underArray)
 
+        case "map":
+            // Our own tag for empty / list-like maps (see the encoder), echoed back by a
+            // snapshot round trip (e.g. the JS wrapper's set(path, snapshot.data)).
+            let entries: [String: Any]
+            if let dict = map["value"] as? [String: Any] {
+                entries = dict
+            } else if let list = map["value"] as? [Any], list.isEmpty {
+                entries = [:]
+            } else {
+                throw NFSError.invalid("Invalid value for a tagged map.")
+            }
+            var result: [String: Any] = [:]
+            for (key, child) in entries {
+                if context.isWrite {
+                    try NFSPaths.guardWritableName(key)
+                }
+                result[key] = try decode(child, db, context: context, depth: depth + 1, underArray: underArray)
+            }
+            return result
+
         default:
             var result: [String: Any] = [:]
             for (key, child) in map {

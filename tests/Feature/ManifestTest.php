@@ -105,3 +105,14 @@ it('stays generic: no app-specific names or Firebase project config in the packa
         }
     }
 });
+
+it('decodes every tag the native encoders emit, so snapshot round trips (incl. the JS wrapper) keep their types', function () {
+    $swift = file_get_contents(__DIR__.'/../../resources/ios/Sources/FirestorePluginCore.swift');
+    $kotlin = file_get_contents(__DIR__.'/../../resources/android/src/FirestorePluginCore.kt');
+
+    // Tags the native side writes towards PHP/JS must be readable when they come back.
+    foreach (['map', 'double', 'timestamp', 'geopoint', 'reference', 'bytes'] as $tag) {
+        expect($swift)->toContain('case "'.$tag.'"')
+            ->and($kotlin)->toContain('"'.$tag.'" ->');
+    }
+});
