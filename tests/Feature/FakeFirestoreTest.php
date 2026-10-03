@@ -186,6 +186,11 @@ describe('queries', function () {
         'array contains any' => ['tags', 'array-contains-any', ['work', 'fun'], ['t1', 't2']],
         'in' => ['owner', 'in', ['bob', null], ['t2', 't4']],
         'not in' => ['owner', 'not-in', ['ann'], ['t2']],
+        'not in with a null in the list matches nothing' => ['owner', 'not-in', ['bob', null], []],
+        'equals null matches null but not missing' => ['owner', '==', null, ['t4']],
+        'not equals null excludes missing' => ['owner', '!=', null, ['t1', 't3', 't2']],
+        'in with only null matches null but not missing' => ['owner', 'in', [null], ['t4']],
+        'array contains any skips missing arrays' => ['tags', 'array-contains-any', ['home', null], ['t2', 't3']],
         'inequality only matches the same type' => ['title', '>', 1, []],
         'timestamp range' => ['due', '>=', new Timestamp(200), ['t3', 't1']],
     ]);

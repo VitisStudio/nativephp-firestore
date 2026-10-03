@@ -747,7 +747,8 @@ class FakeFirestore implements FirestoreDriver
             'array-contains' => WireValues::isList($value) && $this->containsValue($value, $operand),
             'array-contains-any' => WireValues::isList($value) && array_filter($operand, fn ($candidate) => $this->containsValue($value, $candidate)) !== [],
             'in' => $this->containsValue($operand, $value),
-            'not-in' => $value !== null && ! $this->containsValue($operand, $value),
+            // A null in the list makes not-in match nothing, as in Firestore.
+            'not-in' => $value !== null && ! $this->containsValue($operand, null) && ! $this->containsValue($operand, $value),
             default => throw new FirestoreException("Unsupported operator [{$filter['op']}].", FirestoreException::INVALID_ARGUMENT),
         };
     }
