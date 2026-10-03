@@ -775,7 +775,7 @@ enum NFSQueryBuilder {
         case "<": return Filter.whereField(path, isLessThan: value)
         case "<=": return Filter.whereField(path, isLessThanOrEqualTo: value)
         case ">": return Filter.whereField(path, isGreaterThan: value)
-        case ">=": return Filter.whereField(path, isGreaterThanOrEqualTo: value)
+        case ">=": return Filter.whereField(path, isGreaterOrEqualTo: value)
         case "array-contains":
             stats.arrayContains += 1
             return Filter.whereField(path, arrayContains: value)
