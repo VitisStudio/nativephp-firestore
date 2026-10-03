@@ -457,6 +457,12 @@ enum NFSCodec {
             return try decodeTagged(type, map, db, context: context, depth: depth, underArray: underArray || inArray)
         }
 
+        return try decodeEntries(map, db, context: context, depth: depth, underArray: underArray || inArray)
+    }
+
+    /// Every map's entries go through here (plain, tagged, unknown tag) so the field-name
+    /// checks the SDK would otherwise raise uncatchable exceptions for can't be bypassed.
+    private static func decodeEntries(_ map: [String: Any], _ db: Firestore, context: NFSWriteContext, depth: Int, underArray: Bool) throws -> [String: Any] {
         var result: [String: Any] = [:]
         for (key, child) in map {
             guard !key.isEmpty else {
@@ -465,7 +471,7 @@ enum NFSCodec {
             if context.isWrite {
                 try NFSPaths.guardWritableName(key)
             }
-            result[key] = try decode(child, db, context: context, depth: depth + 1, underArray: underArray || inArray)
+            result[key] = try decode(child, db, context: context, depth: depth + 1, underArray: underArray)
         }
         return result
     }
@@ -549,24 +555,10 @@ enum NFSCodec {
             } else {
                 throw NFSError.invalid("Invalid value for a tagged map.")
             }
-            var result: [String: Any] = [:]
-            for (key, child) in entries {
-                if context.isWrite {
-                    try NFSPaths.guardWritableName(key)
-                }
-                result[key] = try decode(child, db, context: context, depth: depth + 1, underArray: underArray)
-            }
-            return result
+            return try decodeEntries(entries, db, context: context, depth: depth, underArray: underArray)
 
         default:
-            var result: [String: Any] = [:]
-            for (key, child) in map {
-                if context.isWrite {
-                    try NFSPaths.guardWritableName(key)
-                }
-                result[key] = try decode(child, db, context: context, depth: depth + 1, underArray: underArray)
-            }
-            return result
+            return try decodeEntries(map, db, context: context, depth: depth, underArray: underArray)
         }
     }
 

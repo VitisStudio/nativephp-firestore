@@ -107,6 +107,18 @@ internal object NfsBridge {
         }
     }
 
+    /** Every map's entries go through here (plain, tagged, unknown tag) so field-name checks can't be bypassed. */
+    private fun decodeEntries(map: Map<*, *>, db: FirebaseFirestore, context: NfsContext, depth: Int, underArray: Boolean): Map<String, Any?> {
+        val result = LinkedHashMap<String, Any?>()
+        for ((key, child) in map) {
+            val name = key.toString()
+            if (name.isEmpty()) throw NfsErrors.invalid("Document field names cannot be empty.")
+            if (context.isWrite) NfsPaths.guardWritableName(name)
+            result[name] = decode(child, db, context, depth + 1, underArray = underArray)
+        }
+        return result
+    }
+
     @Suppress("UNCHECKED_CAST")
     private fun decodePayload(parameters: Map<String, Any>): Map<String, Any?> {
         val raw = parameters["payload"] as? String
@@ -483,14 +495,7 @@ internal object NfsCodec {
                 if (type != null) {
                     decodeTagged(type, value, db, context, depth, underArray || inArray)
                 } else {
-                    val result = LinkedHashMap<String, Any?>()
-                    for ((key, child) in value) {
-                        val name = key.toString()
-                        if (name.isEmpty()) throw NfsErrors.invalid("Document field names cannot be empty.")
-                        if (context.isWrite) NfsPaths.guardWritableName(name)
-                        result[name] = decode(child, db, context, depth + 1, underArray = underArray || inArray)
-                    }
-                    result
+                    decodeEntries(value, db, context, depth, underArray || inArray)
                 }
             }
             else -> throw NfsErrors.invalid("Unsupported value ${value.javaClass.simpleName}.")
@@ -544,15 +549,9 @@ internal object NfsCodec {
                     is List<*> -> if (raw.isEmpty()) emptyMap<String, Any?>() else throw NfsErrors.invalid("Invalid value for a tagged map.")
                     else -> throw NfsErrors.invalid("Invalid value for a tagged map.")
                 }
-                entries.entries.associate {
-                    if (context.isWrite) NfsPaths.guardWritableName(it.key.toString())
-                    it.key.toString() to decode(it.value, db, context, depth + 1, underArray = underArray)
-                }
+                decodeEntries(entries, db, context, depth, underArray)
             }
-            else -> map.entries.associate {
-                if (context.isWrite) NfsPaths.guardWritableName(it.key.toString())
-                it.key.toString() to decode(it.value, db, context, depth + 1, underArray = underArray)
-            }
+            else -> decodeEntries(map, db, context, depth, underArray)
         }
     }
 

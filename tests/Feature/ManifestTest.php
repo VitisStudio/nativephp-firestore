@@ -116,3 +116,15 @@ it('decodes every tag the native encoders emit, so snapshot round trips (incl. t
             ->and($kotlin)->toContain('"'.$tag.'" ->');
     }
 });
+
+it('validates field names for every native map path, tagged maps included', function () {
+    $swift = file_get_contents(__DIR__.'/../../resources/ios/Sources/FirestorePluginCore.swift');
+    $kotlin = file_get_contents(__DIR__.'/../../resources/android/src/FirestorePluginCore.kt');
+
+    // One shared entry decoder holds the empty-name and reserved-name checks...
+    expect(substr_count($swift, 'Document field names cannot be empty.'))->toBe(1)
+        ->and(substr_count($kotlin, 'Document field names cannot be empty.'))->toBe(1)
+        // ...and the plain, tagged-map and unknown-tag paths all route through it.
+        ->and(substr_count($swift, 'try decodeEntries('))->toBeGreaterThanOrEqual(3)
+        ->and(substr_count($kotlin, 'decodeEntries('))->toBeGreaterThanOrEqual(4);
+});
