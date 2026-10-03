@@ -214,3 +214,8 @@ it('reads a MapValue like an array but refuses changes', function () {
         ->and((new MapValue)->isEmpty())->toBeTrue()
         ->and(fn () => $map['2'] = 'c')->toThrow(LogicException::class);
 });
+
+it('refuses a non-finite increment, which cannot cross the bridge to the device', function (float $by) {
+    expect(fn () => \VitisStudio\NativeFirestore\FieldValue::increment($by))
+        ->toThrow(InvalidArgumentException::class, 'finite');
+})->with([NAN, INF, -INF]);

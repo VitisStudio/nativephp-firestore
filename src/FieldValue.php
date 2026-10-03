@@ -29,8 +29,16 @@ final class FieldValue
         return new self(self::SERVER_TIMESTAMP);
     }
 
+    /**
+     * @throws \InvalidArgumentException for NaN or infinite amounts: they can't cross the
+     *                                   JSON bridge to the device, so the fake refuses them too.
+     */
     public static function increment(int|float $by = 1): self
     {
+        if (is_float($by) && ! is_finite($by)) {
+            throw new \InvalidArgumentException('FieldValue::increment() needs a finite number.');
+        }
+
         return new self(self::INCREMENT, $by);
     }
 
