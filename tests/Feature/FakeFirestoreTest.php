@@ -233,6 +233,21 @@ describe('queries', function () {
         'timestamp range' => ['due', '>=', new Timestamp(200), ['t3', 't1']],
     ]);
 
+    it('runs OR queries with an array-contains in each disjunction', function () use ($ids) {
+        $tasks = Firestore::collection('tasks');
+
+        expect($ids($tasks->where(Filter::or(Filter::where('tags', 'array-contains', 'work'), Filter::where('tags', 'array-contains', 'fun')))->get()))
+            ->toBe(['t1', 't2'])
+            ->and($ids($tasks->where('done', '==', false)->where(Filter::or(
+                Filter::where('tags', 'array-contains', 'home'),
+                Filter::where('tags', 'array-contains-any', ['work']),
+            ))->get()))->toBe(['t1', 't3'])
+            ->and(fn () => $tasks->whereArrayContains('tags', 'home')->where(Filter::or(
+                Filter::where('tags', 'array-contains', 'work'),
+                Filter::where('done', '==', true),
+            ))->get())->toThrow(InvalidArgumentException::class);
+    });
+
     it('orders, limits and paginates with cursors', function () use ($ids) {
         $byPriority = Firestore::collection('tasks')->orderBy('priority');
 

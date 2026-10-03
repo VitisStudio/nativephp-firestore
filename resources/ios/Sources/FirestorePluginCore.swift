@@ -713,7 +713,8 @@ enum NFSCodec {
 // MARK: - Queries
 
 enum NFSQueryBuilder {
-    private static let maxDisjunctionValues = 30
+    private static let maxDisjunctions = 30
+    private static let maxNotInValues = 10
 
     /// The SDK checks each clause as it is added and reports a bad one with an
     /// Objective-C exception, which Swift cannot catch. So the whole query
@@ -740,6 +741,14 @@ enum NFSQueryBuilder {
         var stats = FilterStats()
         let filters = try rawFilters.map { try buildFilter($0, db, collectionPath: collectionPath, stats: &stats) }
         try stats.validate()
+        // The top-level filters are an implicit AND.
+        let form = normalForm(["composite": "and", "filters": rawFilters])
+        if form.terms > maxDisjunctions {
+            throw NFSError.invalid("A query can have at most \(maxDisjunctions) disjunctions once its OR, in and array-contains-any filters are expanded.")
+        }
+        if form.arrayContains > 1 {
+            throw NFSError.invalid("Each disjunction of a query can use at most one array-contains or array-contains-any filter.")
+        }
 
         guard let rawOrder = (wire["orderBy"] ?? []) as? [[String: Any]] else {
             throw NFSError.invalid("Query orderBy must be a list.")
@@ -832,8 +841,13 @@ enum NFSQueryBuilder {
         return result
     }
 
+    /// The SDK itself only refuses (with an uncatchable exception) a second
+    /// != or not-in, or not-in beside !=, in or array-contains-any, anywhere
+    /// in the query. The rest are server limits judged per disjunction of the
+    /// query's disjunctive normal form (see normalForm), plus no not-in beside
+    /// an OR; checking them here keeps the offline cache, the server and the
+    /// PHP fake in agreement.
     private struct FilterStats {
-        var arrayContains = 0
         var disjunctive = 0
         var notIn = 0
         var notEqual = 0
@@ -841,9 +855,6 @@ enum NFSQueryBuilder {
         var inequalityFields: [String] = []
 
         func validate() throws {
-            if arrayContains > 1 {
-                throw NFSError.invalid("A query can use at most one array-contains or array-contains-any filter.")
-            }
             if notIn > 1 {
                 throw NFSError.invalid("A query can use at most one not-in filter.")
             }
@@ -854,6 +865,28 @@ enum NFSQueryBuilder {
                 throw NFSError.invalid("not-in cannot be combined with !=, in, array-contains-any or OR filters.")
             }
         }
+    }
+
+    /// Terms in a filter's disjunctive normal form (capped just past the
+    /// limit) and the most array-contains filters any one term holds. in and
+    /// array-contains-any expand into one == / array-contains per value.
+    private static func normalForm(_ wire: [String: Any]) -> (terms: Int, arrayContains: Int) {
+        if let composite = wire["composite"] as? String {
+            let isOr = composite == "or"
+            var terms = isOr ? 0 : 1
+            var arrayContains = 0
+            for child in (wire["filters"] as? [[String: Any]]) ?? [] {
+                let form = normalForm(child)
+                terms = min(isOr ? terms + form.terms : terms * form.terms, maxDisjunctions + 1)
+                // An AND term takes one term from every child; an OR term is one child's term.
+                arrayContains = isOr ? max(arrayContains, form.arrayContains) : arrayContains + form.arrayContains
+            }
+            return (terms, arrayContains)
+        }
+
+        let op = (wire["op"] as? String) ?? ""
+        let count = ["in", "array-contains-any"].contains(op) ? max(1, (wire["value"] as? [Any])?.count ?? 1) : 1
+        return (min(count, maxDisjunctions + 1), ["array-contains", "array-contains-any"].contains(op) ? 1 : 0)
     }
 
     private static func buildFilter(_ wire: [String: Any], _ db: Firestore, collectionPath: String?, stats: inout FilterStats) throws -> Filter {
@@ -885,8 +918,9 @@ enum NFSQueryBuilder {
             guard let values = raw as? [Any], !values.isEmpty else {
                 throw NFSError.invalid("The \(op) operator needs a non-empty list.")
             }
-            guard values.count <= maxDisjunctionValues else {
-                throw NFSError.invalid("The \(op) operator supports at most \(maxDisjunctionValues) values.")
+            let limit = op == "not-in" ? maxNotInValues : maxDisjunctions
+            guard values.count <= limit else {
+                throw NFSError.invalid("The \(op) operator supports at most \(limit) values.")
             }
             return try values.map { try operand($0) }
         }
@@ -924,10 +958,8 @@ enum NFSQueryBuilder {
         case ">": return Filter.whereField(path, isGreaterThan: value)
         case ">=": return Filter.whereField(path, isGreaterOrEqualTo: value)
         case "array-contains":
-            stats.arrayContains += 1
             return Filter.whereField(path, arrayContains: value)
         case "array-contains-any":
-            stats.arrayContains += 1
             stats.disjunctive += 1
             return Filter.whereField(path, arrayContainsAny: try list())
         case "in":

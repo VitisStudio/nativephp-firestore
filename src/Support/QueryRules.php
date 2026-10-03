@@ -17,6 +17,10 @@ final class QueryRules
 
     private const DOCUMENT_ID = '__name__';
 
+    private const MAX_DISJUNCTIONS = 30;
+
+    private const MAX_NOT_IN_VALUES = 10;
+
     /**
      * @param  array<string, mixed>  $wire
      *
@@ -94,11 +98,20 @@ final class QueryRules
     }
 
     /**
+     * The SDKs themselves only refuse a second != or not-in, and not-in next
+     * to !=, in or array-contains-any, anywhere in the query (iOS by raising
+     * an uncatchable exception). The rest are the server's limits, which are
+     * judged per disjunction of the query's disjunctive normal form, where
+     * in and array-contains-any count one term per value: at most 30 terms,
+     * at most one array-contains per term, no not-in beside an OR, and list
+     * sizes of 30 (10 for not-in). Checking them up front keeps the fake, the
+     * offline cache and the server in agreement.
+     *
      * @param  list<array<string, mixed>>  $filters
      */
     private static function validateFilters(array $filters): void
     {
-        $counts = ['arrayContains' => 0, 'disjunctive' => 0, 'notIn' => 0, 'notEqual' => 0, 'or' => 0];
+        $counts = ['disjunctive' => 0, 'notIn' => 0, 'notEqual' => 0, 'or' => 0];
 
         foreach (self::flatten($filters, $counts) as $filter) {
             $operator = $filter['op'] ?? '';
@@ -106,6 +119,14 @@ final class QueryRules
 
             if (($filter['field'] ?? '') === self::DOCUMENT_ID && $isArrayOperator) {
                 throw new InvalidArgumentException("The [{$operator}] operator cannot be used on the document id.");
+            }
+
+            if (in_array($operator, ['in', 'not-in', 'array-contains-any'], true)) {
+                $limit = $operator === 'not-in' ? self::MAX_NOT_IN_VALUES : self::MAX_DISJUNCTIONS;
+
+                if (count((array) $filter['value']) > $limit) {
+                    throw new InvalidArgumentException("The [{$operator}] operator supports at most {$limit} values.");
+                }
             }
 
             if ($operator === 'array-contains-any') {
@@ -124,17 +145,11 @@ final class QueryRules
             }
 
             match ($operator) {
-                'array-contains' => $counts['arrayContains']++,
-                'array-contains-any' => [$counts['arrayContains']++, $counts['disjunctive']++],
-                'in' => $counts['disjunctive']++,
+                'array-contains-any', 'in' => $counts['disjunctive']++,
                 'not-in' => $counts['notIn']++,
                 '!=' => $counts['notEqual']++,
                 default => null,
             };
-        }
-
-        if ($counts['arrayContains'] > 1) {
-            throw new InvalidArgumentException('A query can use at most one array-contains or array-contains-any filter.');
         }
 
         if ($counts['notIn'] > 1) {
@@ -148,6 +163,48 @@ final class QueryRules
         if ($counts['notIn'] > 0 && ($counts['notEqual'] > 0 || $counts['disjunctive'] > 0 || $counts['or'] > 0)) {
             throw new InvalidArgumentException('not-in cannot be combined with !=, in, array-contains-any or OR filters.');
         }
+
+        // The top-level filters are an implicit AND.
+        [$terms, $arrayContains] = self::normalForm(['composite' => 'and', 'filters' => $filters]);
+
+        if ($terms > self::MAX_DISJUNCTIONS) {
+            throw new InvalidArgumentException('A query can have at most '.self::MAX_DISJUNCTIONS.' disjunctions once its OR, in and array-contains-any filters are expanded.');
+        }
+
+        if ($arrayContains > 1) {
+            throw new InvalidArgumentException('Each disjunction of a query can use at most one array-contains or array-contains-any filter.');
+        }
+    }
+
+    /**
+     * The number of terms in a filter's disjunctive normal form (capped just
+     * past the limit) and the most array-contains filters any one term holds.
+     * in and array-contains-any expand into one == / array-contains per value.
+     *
+     * @param  array<string, mixed>  $filter
+     * @return array{0: int, 1: int}
+     */
+    private static function normalForm(array $filter): array
+    {
+        if (! isset($filter['composite'])) {
+            $operator = $filter['op'] ?? '';
+            $terms = in_array($operator, ['in', 'array-contains-any'], true) ? max(1, count((array) $filter['value'])) : 1;
+
+            return [min($terms, self::MAX_DISJUNCTIONS + 1), in_array($operator, ['array-contains', 'array-contains-any'], true) ? 1 : 0];
+        }
+
+        $isOr = $filter['composite'] === 'or';
+        $terms = $isOr ? 0 : 1;
+        $arrayContains = 0;
+
+        foreach ($filter['filters'] ?? [] as $child) {
+            [$childTerms, $childArrayContains] = self::normalForm($child);
+            $terms = min($isOr ? $terms + $childTerms : $terms * $childTerms, self::MAX_DISJUNCTIONS + 1);
+            // An AND term takes one term from every child; an OR term is one child's term.
+            $arrayContains = $isOr ? max($arrayContains, $childArrayContains) : $arrayContains + $childArrayContains;
+        }
+
+        return [$terms, $arrayContains];
     }
 
     /** A wire operand that is null or the tagged NaN double. */

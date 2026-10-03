@@ -165,7 +165,7 @@ use VitisStudio\NativeFirestore\Query\FieldPath;
 $query = Firestore::collection('tasks')
     ->where('done', false)                      // == shorthand
     ->where('priority', '>=', 2)                // == != < <= > >=
-    ->whereIn('owner', ['ada', 'grace'])        // in / not-in (max 30 values)
+    ->whereIn('owner', ['ada', 'grace'])        // in (max 30 values) / not-in (max 10)
     ->whereArrayContains('tags', 'home')        // array-contains
     ->whereArrayContainsAny('tags', ['a', 'b']) // array-contains-any
     ->where(Filter::or(
@@ -188,7 +188,7 @@ Firestore::collection('tasks')->orderBy('priority')->startAt(2)->endBefore(5)->g
 Firestore::collection('tasks')->where(FieldPath::documentId(), 'in', ['t1', 't2']);
 ```
 
-Firestore's own rules apply: inequality filters need composite indexes once they're combined with other fields (the error message contains the link that creates the index), and `not-in` can't be combined with `!=`, `in`, `array-contains-any` or OR filters. A query allows one `!=`, one `not-in` and one `array-contains`/`array-contains-any`; a `not-in` list containing `null` matches nothing. A document cursor needs a value for every field the query is ordered by (explicit `orderBy()` fields plus any inequality-filter fields), and can't use a document whose ordered field holds a server timestamp that hasn't committed yet. It is built from the snapshot you pass, not by re-reading the document, so the next page starts where that snapshot was even if the document has since changed or been deleted. These mistakes surface as an `InvalidArgumentException` (or a `FirestoreException` with code `invalid-argument` from the device) instead of reaching the SDK.
+Firestore's own rules apply: inequality filters need composite indexes once they're combined with other fields (the error message contains the link that creates the index), and `not-in` can't be combined with `!=`, `in`, `array-contains-any` or OR filters. A query allows one `!=` and one `not-in`. OR, `in` and `array-contains-any` filters expand into at most 30 disjunctions (`in` and `array-contains-any` count one per value, so two `in` lists of 5 and 10 values make 50), and each disjunction may hold one `array-contains`/`array-contains-any`, so `tags array-contains 'home' OR tags array-contains 'work'` is fine but ANDing two of them is not. A `not-in` list containing `null` matches nothing. A document cursor needs a value for every field the query is ordered by (explicit `orderBy()` fields plus any inequality-filter fields), and can't use a document whose ordered field holds a server timestamp that hasn't committed yet. It is built from the snapshot you pass, not by re-reading the document, so the next page starts where that snapshot was even if the document has since changed or been deleted. These mistakes surface as an `InvalidArgumentException` (or a `FirestoreException` with code `invalid-argument` from the device) instead of reaching the SDK.
 
 ### Writes
 

@@ -167,6 +167,41 @@ it('rejects filter combinations the native SDKs refuse', function (Closure $buil
     'array-contains on the document id' => [fn ($q) => $q->whereArrayContains('__name__', 'x')],
     'nested arrays in array-contains-any' => [fn ($q) => $q->whereArrayContainsAny('a', [[1, 2]])],
     'nested != inside an AND' => [fn ($q) => $q->where(Filter::and(Filter::where('a', '!=', 1), Filter::where('b', '!=', 2)))],
+    'two != filters across an OR' => [fn ($q) => $q->where(Filter::or(Filter::where('a', '!=', 1), Filter::where('b', '!=', 2)))],
+    'array-contains beside array-contains-any in one disjunction' => [fn ($q) => $q->where(Filter::or(
+        Filter::and(Filter::where('tags', 'array-contains', 'a'), Filter::where('more', 'array-contains-any', ['b'])),
+        Filter::where('n', '==', 1),
+    ))],
+    'an AND distributed over an OR of array-contains' => [fn ($q) => $q->whereArrayContains('x', 1)
+        ->where(Filter::or(Filter::where('tags', 'array-contains', 'home'), Filter::where('tags', 'array-contains', 'work')))],
+    'not-in inside an OR' => [fn ($q) => $q->where(Filter::or(Filter::where('a', 'not-in', [1]), Filter::where('b', '==', 2)))],
+    'more than 30 in values' => [fn ($q) => $q->whereIn('a', range(1, 31))],
+    'more than 30 array-contains-any values' => [fn ($q) => $q->whereArrayContainsAny('a', range(1, 31))],
+    'more than 10 not-in values' => [fn ($q) => $q->whereNotIn('a', range(1, 11))],
+    'in lists multiplying past 30 disjunctions' => [fn ($q) => $q->whereIn('a', range(1, 5))->whereIn('b', range(1, 10))],
+    'an OR of 31 equalities' => [fn ($q) => $q->where(Filter::or(...array_map(fn ($n) => Filter::where('a', '==', $n), range(1, 31))))],
+    'an OR whose in() pushes it past 30' => [fn ($q) => $q->where(Filter::or(Filter::where('a', 'in', range(1, 30)), Filter::where('b', '==', 1)))],
+]);
+
+it('allows OR queries that keep each disjunction within the limits', function (Closure $build) {
+    expect($build(Firestore::collection('c'))->toWire()['filters'])->not->toBeEmpty();
+})->with([
+    'array-contains on each side of an OR' => [fn ($q) => $q->where(Filter::or(
+        Filter::where('tags', 'array-contains', 'home'),
+        Filter::where('tags', 'array-contains', 'work'),
+    ))],
+    'array-contains and array-contains-any in separate disjunctions' => [fn ($q) => $q->where(Filter::or(
+        Filter::where('tags', 'array-contains', 'home'),
+        Filter::where('labels', 'array-contains-any', ['a', 'b']),
+    ))],
+    'an OR of array-contains under an AND of equalities' => [fn ($q) => $q->where('owner', '==', 'ann')
+        ->where(Filter::or(Filter::where('tags', 'array-contains', 'home'), Filter::where('tags', 'array-contains', 'work')))],
+    'in beside array-contains-any' => [fn ($q) => $q->whereIn('a', [1, 2])->whereArrayContainsAny('b', [1, 2, 3])],
+    'array-contains beside in' => [fn ($q) => $q->whereArrayContains('tags', 'x')->whereIn('a', range(1, 30))],
+    'exactly 30 disjunctions' => [fn ($q) => $q->whereIn('a', range(1, 5))->whereIn('b', range(1, 6))],
+    'an OR of 30 equalities' => [fn ($q) => $q->where(Filter::or(...array_map(fn ($n) => Filter::where('a', '==', $n), range(1, 30))))],
+    '10 not-in values' => [fn ($q) => $q->whereNotIn('a', range(1, 10))],
+    'one != inside an OR' => [fn ($q) => $q->where(Filter::or(Filter::where('a', '!=', 1), Filter::where('b', '==', 2)))],
 ]);
 
 it('allows maps in array-contains-any and arrays in in()', function () {

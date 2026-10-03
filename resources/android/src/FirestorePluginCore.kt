@@ -645,10 +645,18 @@ internal object NfsCodec {
 // MARK: - Queries
 
 internal object NfsQueryBuilder {
-    private const val MAX_DISJUNCTION_VALUES = 30
+    private const val MAX_DISJUNCTIONS = 30
+    private const val MAX_NOT_IN_VALUES = 10
 
+    /**
+     * The SDK itself only refuses a second != or not-in, or not-in beside !=,
+     * in or array-contains-any, anywhere in the query (iOS with an uncatchable
+     * exception). The rest are server limits judged per disjunction of the
+     * query's disjunctive normal form (see normalForm), plus no not-in beside
+     * an OR; checking them here keeps the offline cache, the server and the
+     * PHP fake in agreement.
+     */
     private class Stats {
-        var arrayContains = 0
         var disjunctive = 0
         var notIn = 0
         var notEqual = 0
@@ -656,7 +664,6 @@ internal object NfsQueryBuilder {
         val inequalityFields = mutableListOf<String>()
 
         fun validate() {
-            if (arrayContains > 1) throw NfsErrors.invalid("A query can use at most one array-contains or array-contains-any filter.")
             if (notIn > 1) throw NfsErrors.invalid("A query can use at most one not-in filter.")
             if (notEqual > 1) throw NfsErrors.invalid("A query can use at most one != filter.")
             if (notIn > 0 && (notEqual > 0 || disjunctive > 0 || hasOr)) {
@@ -693,6 +700,14 @@ internal object NfsQueryBuilder {
             buildFilter(it as? Map<String, Any?> ?: throw NfsErrors.invalid("Each query filter must be a map."), db, collectionPath, stats)
         }
         stats.validate()
+        // The top-level filters are an implicit AND.
+        val (terms, arrayContains) = normalForm(mapOf("composite" to "and", "filters" to rawFilters))
+        if (terms > MAX_DISJUNCTIONS) {
+            throw NfsErrors.invalid("A query can have at most $MAX_DISJUNCTIONS disjunctions once its OR, in and array-contains-any filters are expanded.")
+        }
+        if (arrayContains > 1) {
+            throw NfsErrors.invalid("Each disjunction of a query can use at most one array-contains or array-contains-any filter.")
+        }
 
         val rawOrder = (wire["orderBy"] ?: emptyList<Any?>()) as? List<*> ?: throw NfsErrors.invalid("Query orderBy must be a list.")
         val explicit = rawOrder.map {
@@ -754,6 +769,31 @@ internal object NfsQueryBuilder {
         return result
     }
 
+    /**
+     * Terms in a filter's disjunctive normal form (capped just past the limit)
+     * and the most array-contains filters any one term holds. in and
+     * array-contains-any expand into one == / array-contains per value.
+     */
+    private fun normalForm(wire: Map<*, *>): Pair<Int, Int> {
+        val composite = wire["composite"] as? String
+        if (composite != null) {
+            val isOr = composite == "or"
+            var terms = if (isOr) 0 else 1
+            var arrayContains = 0
+            for (child in (wire["filters"] as? List<*>) ?: emptyList<Any?>()) {
+                val (childTerms, childArrayContains) = normalForm(child as? Map<*, *> ?: continue)
+                terms = minOf(if (isOr) terms + childTerms else terms * childTerms, MAX_DISJUNCTIONS + 1)
+                // An AND term takes one term from every child; an OR term is one child's term.
+                arrayContains = if (isOr) maxOf(arrayContains, childArrayContains) else arrayContains + childArrayContains
+            }
+            return terms to arrayContains
+        }
+
+        val op = wire["op"] as? String ?: ""
+        val count = if (op == "in" || op == "array-contains-any") maxOf(1, (wire["value"] as? List<*>)?.size ?: 1) else 1
+        return minOf(count, MAX_DISJUNCTIONS + 1) to (if (op == "array-contains" || op == "array-contains-any") 1 else 0)
+    }
+
     @Suppress("UNCHECKED_CAST")
     private fun buildFilter(wire: Map<String, Any?>, db: FirebaseFirestore, collectionPath: String?, stats: Stats): Filter {
         val composite = wire["composite"] as? String
@@ -778,7 +818,8 @@ internal object NfsQueryBuilder {
         fun list(): List<Any?> {
             val values = raw as? List<*>
             if (values.isNullOrEmpty()) throw NfsErrors.invalid("The $op operator needs a non-empty list.")
-            if (values.size > MAX_DISJUNCTION_VALUES) throw NfsErrors.invalid("The $op operator supports at most $MAX_DISJUNCTION_VALUES values.")
+            val limit = if (op == "not-in") MAX_NOT_IN_VALUES else MAX_DISJUNCTIONS
+            if (values.size > limit) throw NfsErrors.invalid("The $op operator supports at most $limit values.")
             return values.map { operand(it) }
         }
 
@@ -806,8 +847,8 @@ internal object NfsQueryBuilder {
             "<=" -> Filter.lessThanOrEqualTo(path, value)
             ">" -> Filter.greaterThan(path, value)
             ">=" -> Filter.greaterThanOrEqualTo(path, value)
-            "array-contains" -> { stats.arrayContains++; Filter.arrayContains(path, value) }
-            "array-contains-any" -> { stats.arrayContains++; stats.disjunctive++; Filter.arrayContainsAny(path, list()) }
+            "array-contains" -> Filter.arrayContains(path, value)
+            "array-contains-any" -> { stats.disjunctive++; Filter.arrayContainsAny(path, list()) }
             "in" -> { stats.disjunctive++; Filter.inArray(path, list()) }
             "not-in" -> { stats.notIn++; Filter.notInArray(path, list()) }
             else -> throw NfsErrors.invalid("Unsupported operator [$op].")
