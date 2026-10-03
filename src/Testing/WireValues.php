@@ -2,6 +2,8 @@
 
 namespace VitisStudio\NativeFirestore\Testing;
 
+use stdClass;
+
 /**
  * Firestore's value ordering and equality, applied to wire-format values.
  * Used by the in-memory fake to evaluate filters, orderBy and cursors the way
@@ -9,6 +11,10 @@ namespace VitisStudio\NativeFirestore\Testing;
  *
  * Cross-type order: null < booleans < numbers < timestamps < strings < bytes
  * < references < geopoints < arrays < maps.
+ *
+ * Maps are stdClass objects (how the fake decodes JSON objects) so an empty
+ * map never collapses into an empty array; a PHP array is a map only when it
+ * has non-list keys.
  */
 final class WireValues
 {
@@ -22,7 +28,8 @@ final class WireValues
 
     public static function isMap(mixed $value): bool
     {
-        return is_array($value) && ! self::isTagged($value) && ($value === [] || ! array_is_list($value));
+        return $value instanceof stdClass
+            || (is_array($value) && ! self::isTagged($value) && ! array_is_list($value));
     }
 
     public static function isList(mixed $value): bool
@@ -41,7 +48,7 @@ final class WireValues
             self::isTagged($value, 'bytes') => 5,
             self::isTagged($value, 'reference') => 6,
             self::isTagged($value, 'geopoint') => 7,
-            self::isList($value) && $value !== [] => 8,
+            self::isList($value) => 8,
             default => 9,
         };
     }
@@ -50,15 +57,6 @@ final class WireValues
     {
         $typeA = self::typeOrder($a);
         $typeB = self::typeOrder($b);
-
-        // An empty PHP array is ambiguous; treat [] vs list as list comparison.
-        if ($a === [] && $typeB === 8) {
-            $typeA = 8;
-        }
-
-        if ($b === [] && $typeA === 8) {
-            $typeB = 8;
-        }
 
         if ($typeA !== $typeB) {
             return $typeA <=> $typeB;
@@ -74,13 +72,21 @@ final class WireValues
             6 => self::compareLists(explode('/', $a['path']), explode('/', $b['path'])),
             7 => [(float) $a['latitude'], (float) $a['longitude']] <=> [(float) $b['latitude'], (float) $b['longitude']],
             8 => self::compareLists($a, $b),
-            default => self::compareMaps((array) $a, (array) $b),
+            default => self::compareMaps(self::entries($a), self::entries($b)),
         };
     }
 
     public static function equals(mixed $a, mixed $b): bool
     {
         return self::compare($a, $b) === 0;
+    }
+
+    /**
+     * @return array<array-key, mixed>
+     */
+    private static function entries(mixed $map): array
+    {
+        return $map instanceof stdClass ? get_object_vars($map) : (array) $map;
     }
 
     private static function number(mixed $value): float|int

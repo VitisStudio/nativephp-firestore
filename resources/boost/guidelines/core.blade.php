@@ -14,6 +14,7 @@ Cloud Firestore + Firebase Auth for NativePHP Mobile through the native Firebase
 
 ### Testing
 - Always use `Firestore::fake()` / `FirebaseAuth::fake()` in tests; replay `$fake->emittedEvents()` into `Native::test()` components with `emitNative()`.
+- In the fake, an awaited commit (wait-for-server on) fails with `unavailable` while offline; simulate server rejections with `$fake->rejectNextCommit()` and races with `$fake->beforeServerCommit(fn ($fake, $paths) => ...)`.
 
 ### Build
 - Requires `php artisan native:run` builds; Jump cannot load the plugin's native code.

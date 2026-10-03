@@ -188,7 +188,7 @@ Firestore::collection('tasks')->orderBy('priority')->startAt(2)->endBefore(5)->g
 Firestore::collection('tasks')->where(FieldPath::documentId(), 'in', ['t1', 't2']);
 ```
 
-Firestore's own rules apply: inequality filters need composite indexes once they're combined with other fields (the error message contains the link that creates the index), and `not-in` can't be combined with `!=`, `in`, `array-contains-any` or OR filters. A query allows one `!=`, one `not-in` and one `array-contains`/`array-contains-any`; a `not-in` list containing `null` matches nothing. A document cursor needs a value for every field the query is ordered by (explicit `orderBy()` fields plus any inequality-filter fields), and can't use a document whose ordered field holds a server timestamp that hasn't committed yet. These mistakes surface as an `InvalidArgumentException` (or a `FirestoreException` with code `invalid-argument` from the device) instead of reaching the SDK.
+Firestore's own rules apply: inequality filters need composite indexes once they're combined with other fields (the error message contains the link that creates the index), and `not-in` can't be combined with `!=`, `in`, `array-contains-any` or OR filters. A query allows one `!=`, one `not-in` and one `array-contains`/`array-contains-any`; a `not-in` list containing `null` matches nothing. A document cursor needs a value for every field the query is ordered by (explicit `orderBy()` fields plus any inequality-filter fields), and can't use a document whose ordered field holds a server timestamp that hasn't committed yet. It is built from the snapshot you pass, not by re-reading the document, so the next page starts where that snapshot was even if the document has since changed or been deleted. These mistakes surface as an `InvalidArgumentException` (or a `FirestoreException` with code `invalid-argument` from the device) instead of reaching the SDK.
 
 ### Writes
 
@@ -370,13 +370,18 @@ it('completes a task', function () {
 
 The fake implements Firestore's semantics, not just storage:
 
-- queries: every operator, OR/AND filters, Firestore's cross-type ordering, implicit ordering by inequality fields, documents missing an `orderBy` field are excluded, cursors, `limitToLast`, collection groups, `count()`
+- queries: every operator, OR/AND filters, Firestore's cross-type ordering (an empty map `new stdClass` and an empty array `[]` are different values, as in Firestore), implicit ordering by inequality fields, documents missing an `orderBy` field are excluded, cursors, `limitToLast`, collection groups, `count()`
 - all `FieldValue`s (`serverTimestamp()` uses Carbon's test clock)
 - `set` / merge / `mergeFields` / dotted `update`, and atomic batches that roll back on failure
 - transactions with real conflict detection: if a document you read changes before commit, the callback re-runs, and after `maxAttempts` you get `aborted`
 - listeners: an initial snapshot plus incremental `docChanges` dispatched through Laravel's event dispatcher, so `Event::fake()` / `Event::assertDispatched()` work
 
-Fake helpers: `seed()`, `seedCollection()`, `document()`, `documents()`, `failNext('permission-denied')`, `commits()`, `emittedEvents()`, `activeListeners()`, `assertExists()`, `assertMissing()`, `assertCount()`, `assertListening()`, `assertNotListening()`. `Firestore::disableNetwork()` makes server reads, `count()` and transactions fail with `unavailable`.
+Fake helpers: `seed()`, `seedCollection()`, `document()`, `documents()`, `failNext('permission-denied')`, `rejectNextCommit()`, `beforeServerCommit()`, `commits()`, `emittedEvents()`, `activeListeners()`, `assertExists()`, `assertMissing()`, `assertCount()`, `assertListening()`, `assertNotListening()`. `Firestore::disableNetwork()` makes server reads, `count()` and transactions fail with `unavailable`.
+
+Writes in the fake behave like they do with wait-for-server off or on:
+
+- **Not waiting** (the default): the commit applies straight away, offline too. `rejectNextCommit()` makes the backend refuse it afterwards: the fake rolls the documents back and dispatches `WriteFailed`, as the SDK does.
+- **Waiting** (`Firestore::waitForServer()` or `FIRESTORE_WAIT_FOR_SERVER=true`): the commit needs the server. Offline it throws `FirestoreException` `unavailable` and changes nothing. On a device the call times out instead (`deadline-exceeded`) and the writes stay queued locally until the device reconnects. `rejectNextCommit('permission-denied')` makes the next awaited commit throw and change nothing. `beforeServerCommit(fn (FakeFirestore $fake, array $paths) => ...)` runs before each awaited commit reaches the server. Use it to change documents the way another device would, or throw a `FirestoreException` to reject the commit.
 
 To drive listener events into a NativeComponent test, replay what the fake emitted:
 
@@ -397,7 +402,7 @@ $screen->assertSee('Buy milk');
 
 ## JavaScript
 
-Web-view apps can call the bridge from JavaScript via `resources/js/firestore.js` (`firestore.*` and `firebaseAuth.*`, one function per bridge function). Values use the same tagged wire format. The PHP API is the recommended interface.
+Web-view apps can call the bridge from JavaScript via `resources/js/firestore.js` (`firestore.*` and `firebaseAuth.*`, one function per bridge function). Values use the same tagged wire format. The native code validates every query and write itself, so a bad one from JavaScript fails with `invalid-argument` instead of crashing the app. A document cursor (`{document, values, inclusive}`) must carry the snapshot's value for each field of the full ordering, ending with `{__type: 'reference', path}` for the document. `Query::toWire()` in PHP shows the exact shape. The PHP API is the recommended interface.
 
 ## Example
 

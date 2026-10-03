@@ -2,13 +2,16 @@
 
 namespace VitisStudio\NativeFirestore\Testing;
 
+use Closure;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Assert as PHPUnit;
+use stdClass;
 use VitisStudio\NativeFirestore\Contracts\FirestoreDriver;
 use VitisStudio\NativeFirestore\DTO\Timestamp;
 use VitisStudio\NativeFirestore\Events\DocumentChanged;
 use VitisStudio\NativeFirestore\Events\QuerySnapshotChanged;
+use VitisStudio\NativeFirestore\Events\WriteFailed;
 use VitisStudio\NativeFirestore\Exceptions\FirestoreException;
 use VitisStudio\NativeFirestore\Support\Path;
 use VitisStudio\NativeFirestore\Support\QueryRules;
@@ -22,10 +25,13 @@ use VitisStudio\NativeFirestore\Support\ValueCodec;
  * Listener snapshots are dispatched synchronously through Laravel's event
  * dispatcher and recorded in emittedEvents(), whose [event, payload] pairs
  * can be replayed into a NativeComponent test with emitNative().
+ *
+ * Documents are stored in wire form with JSON objects kept as stdClass, so an
+ * empty map and an empty array stay different values, as in Firestore.
  */
 class FakeFirestore implements FirestoreDriver
 {
-    /** @var array<string, array<string, mixed>> document path => wire data */
+    /** @var array<string, stdClass> document path => wire data (maps as stdClass) */
     private array $documents = [];
 
     /** @var array<string, int> document path => write counter, for transaction conflicts */
@@ -48,6 +54,12 @@ class FakeFirestore implements FirestoreDriver
     /** @var list<array{code: string, message: string}> */
     private array $failures = [];
 
+    /** @var list<array{code: string, message: string}> */
+    private array $rejections = [];
+
+    /** @var (Closure(FakeFirestore, list<string>): void)|null */
+    private ?Closure $beforeServerCommit = null;
+
     // -------------------------------------------------------------------
     // Test helpers
     // -------------------------------------------------------------------
@@ -61,7 +73,7 @@ class FakeFirestore implements FirestoreDriver
     public function seed(string $path, array $data): static
     {
         $path = Path::document($path);
-        $this->documents[$path] = $this->wire(ValueCodec::encodeMap($data));
+        $this->documents[$path] = $this->typed(ValueCodec::encodeMap($data));
         $this->versions[$path] = ($this->versions[$path] ?? 0) + 1;
 
         return $this;
@@ -90,7 +102,7 @@ class FakeFirestore implements FirestoreDriver
     {
         $path = Path::document($path);
 
-        return isset($this->documents[$path]) ? ValueCodec::decodeMap($this->documents[$path]) : null;
+        return isset($this->documents[$path]) ? ValueCodec::decodeMap($this->export($this->documents[$path])) : null;
     }
 
     /**
@@ -105,7 +117,7 @@ class FakeFirestore implements FirestoreDriver
 
         foreach ($this->documents as $path => $data) {
             if (Path::parent($path) === $collectionPath) {
-                $result[Path::lastSegment($path)] = ValueCodec::decodeMap($data);
+                $result[Path::lastSegment($path)] = ValueCodec::decodeMap($this->export($data));
             }
         }
 
@@ -120,6 +132,34 @@ class FakeFirestore implements FirestoreDriver
     public function failNext(string $code, string $message = 'Simulated failure.'): static
     {
         $this->failures[] = ['code' => $code, 'message' => $message];
+
+        return $this;
+    }
+
+    /**
+     * Make the backend reject the next commit (permission-denied by default),
+     * as security rules would. An awaited commit throws and changes nothing;
+     * a commit that does not wait for the server is applied locally, then
+     * rolled back with a WriteFailed event, like the SDK's latency compensation.
+     */
+    public function rejectNextCommit(string $code = FirestoreException::PERMISSION_DENIED, string $message = 'Missing or insufficient permissions.'): static
+    {
+        $this->rejections[] = ['code' => $code, 'message' => $message];
+
+        return $this;
+    }
+
+    /**
+     * Run a callback just before the server would see each awaited commit
+     * (wait-for-server on), with the fake and the written paths. It can change
+     * documents, as another device acting first would, or throw a
+     * FirestoreException to reject the commit.
+     *
+     * @param  (Closure(FakeFirestore, list<string>): void)|null  $callback
+     */
+    public function beforeServerCommit(?Closure $callback): static
+    {
+        $this->beforeServerCommit = $callback;
 
         return $this;
     }
@@ -214,28 +254,60 @@ class FakeFirestore implements FirestoreDriver
         $this->throwPendingFailure();
         $this->guardSource($source);
 
-        return $this->documentSnapshot(Path::document($path));
+        return $this->export($this->documentSnapshot(Path::document($path)));
     }
 
+    /**
+     * A commit that waits for the server needs it: offline it fails with
+     * unavailable and changes nothing (on a device the call times out
+     * instead, with the writes still queued locally).
+     */
     public function commitWrites(array $writes, bool $waitForServer): void
     {
         $this->throwPendingFailure();
 
-        $writes = $this->wire($writes);
+        $typed = array_map(fn (stdClass|array $write) => (array) $write, (array) $this->typed(array_values($writes)));
+        $paths = array_map(fn (array $write) => Path::document((string) $write['path']), $typed);
+
+        if ($waitForServer) {
+            $this->guardOnline();
+
+            if ($this->beforeServerCommit !== null) {
+                ($this->beforeServerCommit)($this, $paths);
+            }
+
+            if ($rejection = array_shift($this->rejections)) {
+                throw new FirestoreException($rejection['message'], $rejection['code']);
+            }
+        }
+
         $documents = $this->documents;
         $versions = $this->versions;
 
-        foreach ($writes as $write) {
-            $path = Path::document((string) $write['path']);
-            $documents = $this->applyWrite($documents, $path, $write);
-            $versions[$path] = ($versions[$path] ?? 0) + 1;
+        foreach ($typed as $index => $write) {
+            $documents = $this->applyWrite($documents, $paths[$index], $write);
+            $versions[$paths[$index]] = ($versions[$paths[$index]] ?? 0) + 1;
         }
 
+        $before = $this->documents;
         $this->documents = $documents;
         $this->versions = $versions;
-        $this->commits[] = $writes;
+        $this->commits[] = $this->wire($writes);
 
         $this->notifyListeners();
+
+        if (! $waitForServer && $rejection = array_shift($this->rejections)) {
+            // The server refused a write that was only applied locally.
+            array_pop($this->commits);
+            $this->documents = $before;
+
+            foreach ($paths as $path) {
+                $this->versions[$path]++;
+            }
+
+            $this->notifyListeners();
+            $this->emit(WriteFailed::class, ['paths' => array_values(array_unique($paths)), 'code' => $rejection['code'], 'message' => $rejection['message']]);
+        }
     }
 
     public function runQuery(array $query, string $source): array
@@ -243,7 +315,7 @@ class FakeFirestore implements FirestoreDriver
         $this->throwPendingFailure();
         $this->guardSource($source);
 
-        return $this->querySnapshot($this->wire($query));
+        return $this->export($this->querySnapshot($this->typedQuery($query)));
     }
 
     public function count(array $query): int
@@ -251,7 +323,7 @@ class FakeFirestore implements FirestoreDriver
         $this->throwPendingFailure();
         $this->guardOnline();
 
-        return count($this->evaluateQuery($this->wire($query)));
+        return count($this->evaluateQuery($this->typedQuery($query)));
     }
 
     public function beginTransaction(int $maxAttempts): string
@@ -273,7 +345,7 @@ class FakeFirestore implements FirestoreDriver
         $path = Path::document($path);
         $this->transactions[$transactionId]['reads'][$path] = $this->versions[$path] ?? 0;
 
-        return $this->documentSnapshot($path);
+        return $this->export($this->documentSnapshot($path));
     }
 
     public function commitTransaction(string $transactionId, array $writes): bool
@@ -307,7 +379,9 @@ class FakeFirestore implements FirestoreDriver
 
         $id = (string) Str::uuid();
         $this->listeners[$id] = [
-            'target' => $this->wire($target),
+            'target' => ($target['type'] ?? null) === 'document'
+                ? $target
+                : ['type' => 'query', 'query' => $this->typedQuery((array) ($target['query'] ?? []))],
             'includeMetadataChanges' => $includeMetadataChanges,
             'last' => null,
         ];
@@ -352,14 +426,15 @@ class FakeFirestore implements FirestoreDriver
     // -------------------------------------------------------------------
 
     /**
-     * @param  array<string, array<string, mixed>>  $documents
+     * @param  array<string, stdClass>  $documents
      * @param  array<string, mixed>  $write
-     * @return array<string, array<string, mixed>>
+     * @return array<string, stdClass>
      */
     private function applyWrite(array $documents, string $path, array $write): array
     {
         $existing = $documents[$path] ?? null;
-        $data = (array) ($write['data'] ?? []);
+        $data = $write['data'] ?? new stdClass;
+        $data = $data instanceof stdClass ? $data : (object) $data;
 
         switch ($write['type']) {
             case 'delete':
@@ -372,7 +447,7 @@ class FakeFirestore implements FirestoreDriver
                     throw new FirestoreException("No document to update: {$path}", FirestoreException::NOT_FOUND);
                 }
 
-                foreach ($data as $fieldPath => $value) {
+                foreach (get_object_vars($data) as $fieldPath => $value) {
                     $existing = $this->applyField($existing, explode('.', (string) $fieldPath), $value);
                 }
 
@@ -382,23 +457,24 @@ class FakeFirestore implements FirestoreDriver
 
             case 'set':
                 if (! empty($write['mergeFields'])) {
-                    $result = $existing ?? [];
+                    $result = $existing ?? new stdClass;
 
                     foreach ($write['mergeFields'] as $fieldPath) {
                         $segments = explode('.', (string) $fieldPath);
+                        [$present, $value] = $this->lookup($data, $segments);
 
-                        if (! Arr::has($data, $fieldPath)) {
+                        if (! $present) {
                             throw new FirestoreException("Merge field [{$fieldPath}] is not in the data.", FirestoreException::INVALID_ARGUMENT);
                         }
 
-                        $result = $this->applyField($result, $segments, Arr::get($data, $fieldPath));
+                        $result = $this->applyField($result, $segments, $value);
                     }
 
                     $documents[$path] = $result;
                 } elseif (! empty($write['merge'])) {
-                    $documents[$path] = $this->mergeMap($existing ?? [], $data);
+                    $documents[$path] = $this->mergeMap($existing ?? new stdClass, $data);
                 } else {
-                    $documents[$path] = $this->resolveMap([], $data, allowDelete: false);
+                    $documents[$path] = $this->resolveMap(new stdClass, $data, allowDelete: false);
                 }
 
                 return $documents;
@@ -409,67 +485,60 @@ class FakeFirestore implements FirestoreDriver
 
     /**
      * Set (or transform / delete) the value at a field path, creating
-     * intermediate maps.
+     * intermediate maps. Maps are never changed in place: snapshots handed
+     * out earlier share them.
      *
-     * @param  array<string, mixed>  $map
      * @param  list<string>  $segments
-     * @return array<string, mixed>
      */
-    private function applyField(array $map, array $segments, mixed $value): array
+    private function applyField(stdClass $map, array $segments, mixed $value): stdClass
     {
+        $map = clone $map;
         $key = array_shift($segments);
 
         if ($segments === []) {
             if ($this->isSentinel($value, 'delete')) {
-                unset($map[$key]);
+                unset($map->{$key});
 
                 return $map;
             }
 
-            $map[$key] = $this->resolveValue($map[$key] ?? null, $value);
+            $map->{$key} = $this->resolveValue($map->{$key} ?? null, $value);
 
             return $map;
         }
 
-        $child = $map[$key] ?? [];
-        $map[$key] = $this->applyField(WireValues::isMap($child) ? $child : [], $segments, $value);
+        $child = $map->{$key} ?? null;
+        $map->{$key} = $this->applyField($child instanceof stdClass ? $child : new stdClass, $segments, $value);
 
         return $map;
     }
 
     /**
      * Deep-merge for set(..., merge: true).
-     *
-     * @param  array<string, mixed>  $existing
-     * @param  array<string, mixed>  $data
-     * @return array<string, mixed>
      */
-    private function mergeMap(array $existing, array $data): array
+    private function mergeMap(stdClass $existing, stdClass $data): stdClass
     {
-        foreach ($data as $key => $value) {
+        $existing = clone $existing;
+
+        foreach (get_object_vars($data) as $key => $value) {
             if ($this->isSentinel($value, 'delete')) {
-                unset($existing[$key]);
-            } elseif (WireValues::isMap($value) && $value !== []) {
-                $current = $existing[$key] ?? [];
-                $existing[$key] = $this->mergeMap(WireValues::isMap($current) ? $current : [], $value);
+                unset($existing->{$key});
+            } elseif ($value instanceof stdClass && get_object_vars($value) !== []) {
+                $current = $existing->{$key} ?? null;
+                $existing->{$key} = $this->mergeMap($current instanceof stdClass ? $current : new stdClass, $value);
             } else {
-                $existing[$key] = $this->resolveValue($existing[$key] ?? null, $value);
+                $existing->{$key} = $this->resolveValue($existing->{$key} ?? null, $value);
             }
         }
 
         return $existing;
     }
 
-    /**
-     * @param  array<string, mixed>  $existing
-     * @param  array<string, mixed>  $data
-     * @return array<string, mixed>
-     */
-    private function resolveMap(array $existing, array $data, bool $allowDelete): array
+    private function resolveMap(stdClass $existing, stdClass $data, bool $allowDelete): stdClass
     {
-        $result = [];
+        $result = new stdClass;
 
-        foreach ($data as $key => $value) {
+        foreach (get_object_vars($data) as $key => $value) {
             if ($this->isSentinel($value, 'delete')) {
                 if (! $allowDelete) {
                     throw new FirestoreException('FieldValue::delete() can only be used with update() or set() with merge.', FirestoreException::INVALID_ARGUMENT);
@@ -478,9 +547,10 @@ class FakeFirestore implements FirestoreDriver
                 continue;
             }
 
-            $result[$key] = WireValues::isMap($value) && $value !== []
-                ? $this->resolveMap(WireValues::isMap($existing[$key] ?? null) ? $existing[$key] : [], $value, $allowDelete)
-                : $this->resolveValue($existing[$key] ?? null, $value);
+            $current = $existing->{$key} ?? null;
+            $result->{$key} = $value instanceof stdClass && get_object_vars($value) !== []
+                ? $this->resolveMap($current instanceof stdClass ? $current : new stdClass, $value, $allowDelete)
+                : $this->resolveValue($current, $value);
         }
 
         return $result;
@@ -501,8 +571,8 @@ class FakeFirestore implements FirestoreDriver
             };
         }
 
-        if (WireValues::isMap($value) && $value !== []) {
-            return $this->resolveMap(WireValues::isMap($current) ? $current : [], $value, allowDelete: false);
+        if ($value instanceof stdClass && get_object_vars($value) !== []) {
+            return $this->resolveMap($current instanceof stdClass ? $current : new stdClass, $value, allowDelete: false);
         }
 
         if (WireValues::isList($value)) {
@@ -556,6 +626,8 @@ class FakeFirestore implements FirestoreDriver
     // -------------------------------------------------------------------
 
     /**
+     * A snapshot with typed data; export() turns it into the bridge shape.
+     *
      * @return array<string, mixed>
      */
     private function documentSnapshot(string $path): array
@@ -567,7 +639,7 @@ class FakeFirestore implements FirestoreDriver
             'path' => $path,
             'exists' => $exists,
             'data' => $exists ? $this->documents[$path] : null,
-            'metadata' => ['fromCache' => ! $this->networkEnabled, 'hasPendingWrites' => false],
+            'metadata' => ['fromCache' => ! $this->networkEnabled, 'hasPendingWrites' => false, 'pendingServerTimestamps' => []],
         ];
     }
 
@@ -738,14 +810,21 @@ class FakeFirestore implements FirestoreDriver
             return [true, ['__type' => 'reference', 'path' => $path]];
         }
 
-        $current = $this->documents[$path] ?? [];
+        return isset($this->documents[$path]) ? $this->lookup($this->documents[$path], explode('.', $field)) : [false, null];
+    }
 
-        foreach (explode('.', $field) as $segment) {
-            if (! is_array($current) || WireValues::isTagged($current) || ! array_key_exists($segment, $current)) {
+    /**
+     * @param  list<string>  $segments
+     * @return array{0: bool, 1: mixed}
+     */
+    private function lookup(mixed $current, array $segments): array
+    {
+        foreach ($segments as $segment) {
+            if (! $current instanceof stdClass || ! property_exists($current, $segment)) {
                 return [false, null];
             }
 
-            $current = $current[$segment];
+            $current = $current->{$segment};
         }
 
         return [true, $current];
@@ -790,22 +869,25 @@ class FakeFirestore implements FirestoreDriver
     private function cursorValues(array $cursor, array $orderBy, array $query): array
     {
         if (isset($cursor['document'])) {
+            // A snapshot cursor carries the snapshot's own values, so it keeps
+            // its position even if the document has changed or gone since.
             $path = Path::document($cursor['document']);
+            $values = array_values($cursor['values'] ?? []);
 
-            if (! isset($this->documents[$path])) {
-                throw new FirestoreException("Cursor document [{$path}] does not exist.", FirestoreException::INVALID_ARGUMENT);
-            }
-
-            $missing = QueryRules::missingCursorFields($query, fn (string $field) => $this->field($path, $field)[0]);
-
-            if ($missing !== []) {
+            if (count($values) !== count($orderBy)) {
                 throw new FirestoreException(
-                    sprintf('The cursor document [%s] has no [%s] field, which the query is ordered by.', $path, implode(', ', $missing)),
+                    "The cursor for document [{$path}] needs one value per ordered field (".implode(', ', array_column($orderBy, 'field')).').',
                     FirestoreException::INVALID_ARGUMENT,
                 );
             }
 
-            return array_map(fn (array $order) => $this->field($path, $order['field'])[1], $orderBy);
+            foreach ($orderBy as $index => $order) {
+                if ($order['field'] === '__name__' && ! (WireValues::isTagged($values[$index], 'reference') && Path::document($values[$index]['path']) === $path)) {
+                    throw new FirestoreException("The cursor for document [{$path}] must end in a reference to it.", FirestoreException::INVALID_ARGUMENT);
+                }
+            }
+
+            return $values;
         }
 
         $values = array_values($cursor['values']);
@@ -873,9 +955,10 @@ class FakeFirestore implements FirestoreDriver
                 'path' => $snapshot['path'],
                 'id' => $snapshot['id'],
                 'exists' => $snapshot['exists'],
-                'data' => $snapshot['data'],
+                'data' => $this->export($snapshot['data']),
                 'fromCache' => $snapshot['metadata']['fromCache'],
                 'hasPendingWrites' => false,
+                'pendingServerTimestamps' => [],
             ]);
 
             return;
@@ -892,8 +975,8 @@ class FakeFirestore implements FirestoreDriver
         $this->emit(QuerySnapshotChanged::class, [
             'listenerId' => $id,
             'path' => $target['query']['path'],
-            'documents' => $snapshot['documents'],
-            'changes' => $snapshot['changes'],
+            'documents' => $this->export($snapshot['documents']),
+            'changes' => $this->export($snapshot['changes']),
             'fromCache' => $snapshot['metadata']['fromCache'],
             'hasPendingWrites' => false,
         ]);
@@ -997,5 +1080,82 @@ class FakeFirestore implements FirestoreDriver
     private function wire(mixed $payload): mixed
     {
         return json_decode(ValueCodec::json($payload), true, 512, JSON_THROW_ON_ERROR);
+    }
+
+    /**
+     * Typed data back in the shape the native bridge returns (JSON decoded to
+     * PHP arrays), as consumers see it.
+     */
+    private function export(mixed $value): mixed
+    {
+        return $this->wire($value);
+    }
+
+    /**
+     * A payload through JSON with objects kept as stdClass, so maps stay maps
+     * (an empty map, or one with numeric keys, is not a list). Tagged values
+     * become arrays again.
+     */
+    private function typed(mixed $payload): mixed
+    {
+        return $this->normalize(json_decode(ValueCodec::json($payload), false, 512, JSON_THROW_ON_ERROR));
+    }
+
+    private function normalize(mixed $value): mixed
+    {
+        if (is_array($value)) {
+            return array_map($this->normalize(...), $value);
+        }
+
+        if (! $value instanceof stdClass) {
+            return $value;
+        }
+
+        $properties = get_object_vars($value);
+
+        if (isset($properties['__type']) && is_string($properties['__type'])) {
+            return array_map($this->normalize(...), $properties);
+        }
+
+        $map = new stdClass;
+
+        foreach ($properties as $key => $child) {
+            $map->{$key} = $this->normalize($child);
+        }
+
+        return $map;
+    }
+
+    /**
+     * The query envelope as arrays, its operands and cursor values typed.
+     *
+     * @param  array<string, mixed>  $query
+     * @return array<string, mixed>
+     */
+    private function typedQuery(array $query): array
+    {
+        $typed = (array) $this->typed($query);
+        $typed['filters'] = array_map($this->typedFilter(...), (array) ($typed['filters'] ?? []));
+        $typed['orderBy'] = array_map(fn (stdClass|array $order) => (array) $order, (array) ($typed['orderBy'] ?? []));
+
+        foreach (['startAt', 'endAt'] as $edge) {
+            $typed[$edge] = isset($typed[$edge]) ? (array) $typed[$edge] : null;
+        }
+
+        return $typed;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function typedFilter(stdClass|array $filter): array
+    {
+        $filter = (array) $filter;
+
+        if (isset($filter['composite'])) {
+            $filter['filters'] = array_map($this->typedFilter(...), (array) ($filter['filters'] ?? []));
+        }
+
+        return $filter;
     }
 }

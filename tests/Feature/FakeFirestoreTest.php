@@ -7,6 +7,7 @@ use VitisStudio\NativeFirestore\DTO\GeoPoint;
 use VitisStudio\NativeFirestore\DTO\Timestamp;
 use VitisStudio\NativeFirestore\Events\DocumentChanged;
 use VitisStudio\NativeFirestore\Events\QuerySnapshotChanged;
+use VitisStudio\NativeFirestore\Events\WriteFailed;
 use VitisStudio\NativeFirestore\Exceptions\FirestoreException;
 use VitisStudio\NativeFirestore\Facades\Firestore;
 use VitisStudio\NativeFirestore\FieldValue;
@@ -247,12 +248,70 @@ describe('queries', function () {
         expect($ids($page2))->toBe(['t4', 't1']);
     });
 
-    it('rejects a cursor document that lacks a field the query is ordered by', function () {
-        $snapshot = Firestore::doc('tasks/t1')->get();
-        Firestore::doc('tasks/t1')->update(['priority' => FieldValue::delete()]);
+    it('rejects a cursor snapshot that lacks a field the query is ordered by', function () {
+        $snapshot = Firestore::doc('tasks/t5')->get();
 
         expect(fn () => Firestore::collection('tasks')->orderBy('priority')->startAfter($snapshot)->get())
+            ->toThrow(InvalidArgumentException::class, '[priority]');
+    });
+
+    it('keeps a snapshot cursor where the snapshot was after its document changes or is deleted', function () use ($ids) {
+        $byPriority = Firestore::collection('tasks')->orderBy('priority');
+        $first = $byPriority->limit(1)->get()->documents()[0];
+
+        Firestore::doc('tasks/t2')->update(['priority' => 4]);
+        expect($ids($byPriority->startAfter($first)->get()))->toBe(['t3', 't4', 't1', 't2']);
+
+        Firestore::doc('tasks/t2')->delete();
+        expect($ids($byPriority->startAfter($first)->get()))->toBe(['t3', 't4', 't1'])
+            ->and($ids($byPriority->endBefore($first)->get()))->toBe([]);
+    });
+
+    it('rejects a hand-built document cursor without the snapshot values', function () {
+        $wire = Firestore::collection('tasks')->orderBy('priority')->toWire();
+        $wire['startAt'] = ['document' => 'tasks/t1', 'inclusive' => true];
+
+        expect(fn () => $this->fake->runQuery($wire, 'default'))
             ->toThrow(fn (FirestoreException $e) => expect($e->is(FirestoreException::INVALID_ARGUMENT))->toBeTrue());
+    });
+
+    it('keeps empty maps and empty arrays apart', function () use ($ids) {
+        Firestore::doc('shapes/list')->set(['x' => []]);
+        Firestore::doc('shapes/map')->set(['x' => new stdClass]);
+        Firestore::doc('shapes/numericMap')->set(['x' => (object) ['0' => 'a']]);
+        Firestore::doc('shapes/list1')->set(['x' => ['a']]);
+
+        $shapes = Firestore::collection('shapes');
+
+        expect($ids($shapes->where('x', '==', [])->get()))->toBe(['list'])
+            ->and($ids($shapes->where('x', '==', new stdClass)->get()))->toBe(['map'])
+            ->and($ids($shapes->where('x', '==', (object) ['0' => 'a'])->get()))->toBe(['numericMap'])
+            ->and($ids($shapes->where('x', '==', ['a'])->get()))->toBe(['list1'])
+            ->and($ids($shapes->where('x', 'in', [[], ['a']])->get()))->toBe(['list', 'list1'])
+            ->and($ids($shapes->where('x', 'not-in', [[]])->get()))->toBe(['list1', 'map', 'numericMap'])
+            // Arrays sort before maps, the empty value first in each.
+            ->and($ids($shapes->orderBy('x')->get()))->toBe(['list', 'list1', 'map', 'numericMap'])
+            ->and($ids($shapes->where('x', '>=', new stdClass)->get()))->toBe(['map', 'numericMap'])
+            ->and($ids($shapes->where('x', '<', new stdClass)->get()))->toBe([]);
+
+        Firestore::doc('shapes/holder')->set(['items' => [new stdClass, 1]]);
+        expect($ids($shapes->whereArrayContains('items', new stdClass)->get()))->toBe(['holder'])
+            ->and($ids($shapes->whereArrayContains('items', [])->get()))->toBe([])
+            ->and($ids($shapes->whereArrayContainsAny('items', [new stdClass, 2])->get()))->toBe(['holder'])
+            ->and(fn () => $shapes->whereArrayContainsAny('items', [[], 2])->get())->toThrow(InvalidArgumentException::class);
+
+        // Snapshots come back the way the device bridge returns them.
+        expect(Firestore::doc('shapes/map')->get()->data())->toBe(['x' => []])
+            ->and(Firestore::doc('shapes/numericMap')->get()->data())->toBe(['x' => ['a']]);
+    });
+
+    it('keeps an empty map an empty map through merges and nested updates', function () use ($ids) {
+        Firestore::doc('shapes/a')->set(['m' => ['k' => 1]]);
+        Firestore::doc('shapes/a')->update(['m.k' => FieldValue::delete()]);
+        Firestore::doc('shapes/b')->set(['m' => new stdClass], merge: true);
+
+        expect($ids(Firestore::collection('shapes')->where('m', '==', new stdClass)->get()))->toBe(['a', 'b'])
+            ->and($ids(Firestore::collection('shapes')->where('m', '==', [])->get()))->toBe([]);
     });
 
     it('orders implicitly by every inequality field and paginates over them with a document', function () use ($ids) {
@@ -532,6 +591,74 @@ describe('network and failures', function () {
         }
 
         expect(Firestore::doc('secret/x')->get()->exists())->toBeFalse();
+    });
+
+    it('fails a commit that waits for the server while offline, changing nothing', function () {
+        Firestore::disableNetwork();
+
+        Firestore::doc('a/local')->set(['n' => 1]);
+        expect(Firestore::doc('a/local')->get()->exists())->toBeTrue();
+
+        Firestore::waitForServer();
+
+        expect(fn () => Firestore::doc('a/awaited')->set(['n' => 1]))
+            ->toThrow(fn (FirestoreException $e) => expect($e->is(FirestoreException::UNAVAILABLE))->toBeTrue());
+
+        expect(Firestore::doc('a/awaited')->get()->exists())->toBeFalse()
+            ->and($this->fake->commits())->toHaveCount(1);
+
+        Firestore::enableNetwork();
+        Firestore::doc('a/awaited')->set(['n' => 1]);
+        expect(Firestore::doc('a/awaited')->get()->exists())->toBeTrue();
+    });
+
+    it('lets the server reject an awaited commit, which changes nothing', function () {
+        Firestore::waitForServer();
+        $this->fake->rejectNextCommit();
+
+        try {
+            Firestore::doc('a/1')->set(['n' => 1]);
+            $this->fail('Expected permission-denied.');
+        } catch (FirestoreException $exception) {
+            expect($exception->isPermissionDenied())->toBeTrue();
+        }
+
+        $this->fake->assertMissing('a/1');
+        expect($this->fake->commits())->toBe([]);
+
+        Firestore::doc('a/1')->set(['n' => 1]);
+        $this->fake->assertExists('a/1');
+    });
+
+    it('rolls a rejected unawaited commit back and reports it with WriteFailed', function () {
+        Event::fake([WriteFailed::class]);
+        Firestore::doc('a/1')->set(['n' => 1]);
+        $this->fake->rejectNextCommit(FirestoreException::PERMISSION_DENIED, 'Nope.');
+
+        Firestore::doc('a/1')->set(['n' => 2]);
+
+        expect(Firestore::doc('a/1')->get()->get('n'))->toBe(1)
+            ->and($this->fake->commits())->toHaveCount(1);
+        Event::assertDispatched(WriteFailed::class, fn (WriteFailed $event) => $event->paths === ['a/1'] && $event->code === 'permission-denied' && $event->message === 'Nope.');
+    });
+
+    it('runs a hook before each awaited commit reaches the server', function () {
+        $seen = [];
+        $this->fake->beforeServerCommit(function ($fake, array $paths) use (&$seen) {
+            $seen[] = $paths;
+            $fake->seed('a/other', ['by' => 'another device']);
+        });
+
+        Firestore::doc('a/unawaited')->set(['n' => 1]);
+        Firestore::waitForServer();
+        Firestore::batch()->set(Firestore::doc('a/1'), ['n' => 1])->delete(Firestore::doc('a/2'))->commit();
+
+        expect($seen)->toBe([['a/1', 'a/2']]);
+        $this->fake->assertExists('a/other')->assertExists('a/1');
+
+        $this->fake->beforeServerCommit(fn () => throw new FirestoreException('Refused.', FirestoreException::PERMISSION_DENIED));
+        expect(fn () => Firestore::doc('a/3')->set(['n' => 1]))->toThrow(FirestoreException::class, 'Refused.');
+        $this->fake->assertMissing('a/3');
     });
 
     it('reports fake status', function () {
