@@ -9,8 +9,8 @@ enum FirebaseAuthFunctions {
         func execute(parameters: [String: Any]) throws -> [String: Any] {
             NFSBridge.handle(parameters) { payload in
                 let auth = try NFSRuntime.shared.auth()
-                let email = (payload["email"] as? String) ?? ""
-                let password = (payload["password"] as? String) ?? ""
+                let email = try NFSAuthSupport.required(payload, "email")
+                let password = try NFSAuthSupport.required(payload, "password")
                 return try NFSAuthSupport.authResult("Sign-in") { done in
                     auth.signIn(withEmail: email, password: password, completion: done)
                 }
@@ -22,8 +22,8 @@ enum FirebaseAuthFunctions {
         func execute(parameters: [String: Any]) throws -> [String: Any] {
             NFSBridge.handle(parameters) { payload in
                 let auth = try NFSRuntime.shared.auth()
-                let email = (payload["email"] as? String) ?? ""
-                let password = (payload["password"] as? String) ?? ""
+                let email = try NFSAuthSupport.required(payload, "email")
+                let password = try NFSAuthSupport.required(payload, "password")
                 return try NFSAuthSupport.authResult("Creating the account") { done in
                     auth.createUser(withEmail: email, password: password, completion: done)
                 }
@@ -83,7 +83,7 @@ enum FirebaseAuthFunctions {
         func execute(parameters: [String: Any]) throws -> [String: Any] {
             NFSBridge.handle(parameters) { payload in
                 let auth = try NFSRuntime.shared.auth()
-                let email = (payload["email"] as? String) ?? ""
+                let email = try NFSAuthSupport.required(payload, "email")
                 try NFSOperations.awaitCompletion("Sending the password reset email") { done in
                     auth.sendPasswordReset(withEmail: email, completion: done)
                 }

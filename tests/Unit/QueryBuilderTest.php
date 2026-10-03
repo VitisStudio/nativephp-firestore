@@ -1,6 +1,7 @@
 <?php
 
 use VitisStudio\NativeFirestore\DTO\DocumentSnapshot;
+use VitisStudio\NativeFirestore\DTO\Timestamp;
 use VitisStudio\NativeFirestore\Facades\Firestore;
 use VitisStudio\NativeFirestore\FieldValue;
 use VitisStudio\NativeFirestore\Query\Filter;
@@ -81,13 +82,33 @@ it('requires an orderBy for limitToLast', function () {
         ->toMatchArray(['limit' => 2, 'limitType' => 'last']);
 });
 
-it('uses a document snapshot as a cursor by path', function () {
-    $snapshot = DocumentSnapshot::fromArray(['path' => 'c/d1', 'exists' => true, 'data' => ['n' => 1]]);
+it('sends a document snapshot cursor with the snapshot values for the whole ordering', function () {
+    $snapshot = DocumentSnapshot::fromArray(['path' => 'c/d1', 'exists' => true, 'data' => ['n' => 1, 'at' => ['__type' => 'timestamp', 'seconds' => 5, 'nanoseconds' => 0], 'm' => 'x']]);
 
     expect(Firestore::collection('c')->orderBy('n')->startAt($snapshot)->endBefore(9)->toWire())->toMatchArray([
-        'startAt' => ['document' => 'c/d1', 'inclusive' => true],
+        'startAt' => ['document' => 'c/d1', 'inclusive' => true, 'values' => [1, ['__type' => 'reference', 'path' => 'c/d1']]],
         'endAt' => ['values' => [9], 'inclusive' => false],
     ]);
+
+    // Explicit fields, then unordered inequality fields in field-path order, then the document id.
+    expect(Firestore::collection('c')->where('m', '>', 'a')->where('at', '!=', null)->orderByDesc('n')->startAfter($snapshot)->toWire()['startAt']['values'])
+        ->toBe([1, ['__type' => 'timestamp', 'seconds' => 5, 'nanoseconds' => 0], 'x', ['__type' => 'reference', 'path' => 'c/d1']]);
+});
+
+it('rejects a document cursor whose ordered field holds a pending server timestamp', function () {
+    $snapshot = DocumentSnapshot::fromArray([
+        'path' => 'c/d1',
+        'exists' => true,
+        'data' => ['n' => 1, 'at' => null, 'meta' => ['seen' => null]],
+        'metadata' => ['hasPendingWrites' => true, 'pendingServerTimestamps' => ['at', 'meta.seen']],
+    ]);
+
+    expect(fn () => Firestore::collection('c')->orderBy('at')->startAfter($snapshot)->toWire())
+        ->toThrow(InvalidArgumentException::class, 'pending server timestamp in [at]')
+        ->and(fn () => Firestore::collection('c')->orderBy('meta')->startAfter($snapshot)->toWire())
+        ->toThrow(InvalidArgumentException::class, 'pending server timestamp in [meta]')
+        ->and(Firestore::collection('c')->orderBy('n')->startAfter($snapshot)->toWire()['startAt']['values'])
+        ->toBe([1, ['__type' => 'reference', 'path' => 'c/d1']]);
 });
 
 it('validates paths', function () {
@@ -119,7 +140,13 @@ it('rejects a document cursor that lacks a field the query is ordered by', funct
         ->toThrow(InvalidArgumentException::class, '[meta.level]');
 
     expect(Firestore::collection('c')->orderBy('n')->orderBy('gone')->where('n', '!=', 3)->startAt($snapshot)->toWire()['startAt'])
-        ->toBe(['document' => 'c/d1', 'inclusive' => true]);
+        ->toBe(['document' => 'c/d1', 'inclusive' => true, 'values' => [1, null, ['__type' => 'reference', 'path' => 'c/d1']]]);
+});
+
+it('accepts timestamps and maps but not arrays as array-contains-any values', function () {
+    expect(Firestore::collection('c')->whereArrayContainsAny('a', [new Timestamp(1), ['k' => 1]])->toWire()['filters'][0]['value'])
+        ->toEqual([['__type' => 'timestamp', 'seconds' => 1, 'nanoseconds' => 0], (object) ['k' => 1]])
+        ->and(fn () => Firestore::collection('c')->whereArrayContainsAny('a', [[1]])->toWire())->toThrow(InvalidArgumentException::class);
 });
 
 it('rejects more cursor values than orderBy clauses', function () {

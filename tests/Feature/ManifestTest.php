@@ -77,7 +77,7 @@ it('declares real event classes that the native payload keys can construct', fun
         ->and(nativeSource('ios'))->toContain(str_replace('\\', '\\\\', $event))
         ->and(nativeSource('android'))->toContain(str_replace('\\', '\\\\', $event));
 })->with([
-    [VitisStudio\NativeFirestore\Events\DocumentChanged::class, ['listenerId', 'path', 'id', 'exists', 'data', 'fromCache', 'hasPendingWrites']],
+    [VitisStudio\NativeFirestore\Events\DocumentChanged::class, ['listenerId', 'path', 'id', 'exists', 'data', 'fromCache', 'hasPendingWrites', 'pendingServerTimestamps']],
     [VitisStudio\NativeFirestore\Events\QuerySnapshotChanged::class, ['listenerId', 'path', 'documents', 'changes', 'fromCache', 'hasPendingWrites']],
     [VitisStudio\NativeFirestore\Events\ListenerFailed::class, ['listenerId', 'code', 'message']],
     [VitisStudio\NativeFirestore\Events\WriteFailed::class, ['paths', 'code', 'message']],

@@ -579,8 +579,34 @@ internal object NfsCodec {
         "path" to snapshot.reference.path,
         "exists" to snapshot.exists(),
         "data" to if (snapshot.exists()) encode(snapshot.getData(NfsRuntime.serverTimestamps) ?: emptyMap<String, Any?>()) else null,
-        "metadata" to metadata(snapshot.metadata),
+        "metadata" to metadata(snapshot.metadata) + ("pendingServerTimestamps" to pendingServerTimestamps(snapshot)),
     )
+
+    /**
+     * Fields holding a server timestamp the backend has not set yet: null
+     * without an estimate, a timestamp with one. PHP needs these to refuse
+     * such a snapshot as a query cursor.
+     */
+    fun pendingServerTimestamps(snapshot: DocumentSnapshot): List<String> {
+        if (!snapshot.exists() || !snapshot.metadata.hasPendingWrites()) return emptyList()
+        val estimated = snapshot.getData(DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) ?: return emptyList()
+        val raw = snapshot.getData(DocumentSnapshot.ServerTimestampBehavior.NONE) ?: return emptyList()
+
+        val pending = mutableListOf<String>()
+        fun walk(estimated: Map<*, *>, raw: Map<*, *>, prefix: String) {
+            for ((key, value) in estimated) {
+                val path = if (prefix.isEmpty()) key.toString() else "$prefix.$key"
+                val rawValue = raw[key]
+                if (value is Timestamp && raw.containsKey(key) && rawValue == null) {
+                    pending.add(path)
+                } else if (value is Map<*, *> && rawValue is Map<*, *>) {
+                    walk(value, rawValue, path)
+                }
+            }
+        }
+        walk(estimated, raw, "")
+        return pending.sorted()
+    }
 
     fun query(snapshot: QuerySnapshot): Map<String, Any?> = mapOf(
         "documents" to snapshot.documents.map { document(it) },
@@ -628,50 +654,93 @@ internal object NfsQueryBuilder {
         }
     }
 
+    private class OrderClause(val field: String, val path: FieldPath, val descending: Boolean)
+
+    private class CursorBound(val values: Array<Any?>, val inclusive: Boolean, val isSnapshot: Boolean)
+
+    /**
+     * The whole query spec (filters including nested OR/AND, ordering, limit,
+     * cursors) is decoded and validated before any SDK query call, mirroring
+     * iOS, where the SDK reports a bad clause with an uncatchable exception.
+     * PHP validates too, but the JavaScript bridge wrappers reach this directly.
+     */
     @Suppress("UNCHECKED_CAST")
     fun build(wire: Map<String, Any?>, db: FirebaseFirestore): Query {
         val path = wire["path"] as? String ?: ""
         val isGroup = wire["collectionGroup"] as? Boolean ?: false
-        val collectionPath = if (isGroup) null else path
+        val collectionPath = if (isGroup) null else NfsPaths.segments(path).joinToString("/")
 
-        var query: Query = if (isGroup) {
+        if (isGroup) {
             if (path.isEmpty() || path.contains("/")) throw NfsErrors.invalid("Invalid collection group id [$path].")
-            db.collectionGroup(path)
-        } else {
-            NfsPaths.collection(path, db)
+        } else if (collectionPath!!.split("/").size % 2 != 1) {
+            throw NfsErrors.invalid("[$path] is not a collection path.")
         }
 
+        val rawFilters = (wire["filters"] ?: emptyList<Any?>()) as? List<*> ?: throw NfsErrors.invalid("Query filters must be a list.")
         val stats = Stats()
-        for (filter in (wire["filters"] as? List<Map<String, Any?>>) ?: emptyList()) {
-            query = query.where(buildFilter(filter, db, collectionPath, stats))
+        val filters = rawFilters.map {
+            buildFilter(it as? Map<String, Any?> ?: throw NfsErrors.invalid("Each query filter must be a map."), db, collectionPath, stats)
         }
         stats.validate()
 
-        val orderBy = (wire["orderBy"] as? List<Map<String, Any?>>) ?: emptyList()
-        for (order in orderBy) {
-            val direction = if (order["direction"] == "desc") Query.Direction.DESCENDING else Query.Direction.ASCENDING
-            query = query.orderBy(NfsPaths.fieldPath(order["field"] as? String ?: ""), direction)
+        val rawOrder = (wire["orderBy"] ?: emptyList<Any?>()) as? List<*> ?: throw NfsErrors.invalid("Query orderBy must be a list.")
+        val explicit = rawOrder.map {
+            val order = it as? Map<String, Any?> ?: throw NfsErrors.invalid("Each orderBy clause must be a map.")
+            val field = order["field"] as? String ?: ""
+            val direction = order["direction"] as? String ?: "asc"
+            if (direction != "asc" && direction != "desc") throw NfsErrors.invalid("Order direction must be asc or desc.")
+            OrderClause(field, NfsPaths.fieldPath(field), direction == "desc")
         }
 
-        (wire["limit"] as? Number)?.toLong()?.let { limit ->
-            if (limit < 1) throw NfsErrors.invalid("A query limit must be at least 1.")
-            query = if (wire["limitType"] == "last") {
-                if (orderBy.isEmpty()) throw NfsErrors.invalid("limitToLast() requires an orderBy() clause.")
-                query.limitToLast(limit)
-            } else {
-                query.limit(limit)
+        var limit: Pair<Long, Boolean>? = null
+        wire["limit"]?.let { raw ->
+            val number = raw as? Number
+            if (number == null || number.toDouble() < 1 || number.toDouble() > Int.MAX_VALUE) {
+                throw NfsErrors.invalid("A query limit must be a whole number from 1 to ${Int.MAX_VALUE}.")
             }
+            val isLast = wire["limitType"] == "last"
+            if (isLast && explicit.isEmpty()) throw NfsErrors.invalid("limitToLast() requires an orderBy() clause.")
+            limit = number.toLong() to isLast
         }
 
-        val orderFields = orderBy.map { it["field"] as? String ?: "" }
-        val implicitFields = stats.inequalityFields.distinct()
-            .filter { it != "__name__" && it !in orderFields }
-            .sortedWith { a, b -> compareFieldPaths(a, b) }
-        val normalizedFields = orderFields + implicitFields
-        (wire["startAt"] as? Map<String, Any?>)?.let { query = applyCursor(query, it, true, orderFields, normalizedFields, db, collectionPath) }
-        (wire["endAt"] as? Map<String, Any?>)?.let { query = applyCursor(query, it, false, orderFields, normalizedFields, db, collectionPath) }
+        val normalized = normalizedOrder(explicit, stats.inequalityFields)
+        val start = (wire["startAt"] as? Map<String, Any?>)?.let { cursorBound(it, explicit, normalized, db, collectionPath) }
+        val end = (wire["endAt"] as? Map<String, Any?>)?.let { cursorBound(it, explicit, normalized, db, collectionPath) }
+
+        // A snapshot cursor positions on the full normalized ordering, but value
+        // cursors may only cover explicit orderBy clauses, so the implicit ones
+        // are spelled out. The SDK normalizes to this same ordering anyway.
+        val ordering = if (start?.isSnapshot == true || end?.isSnapshot == true) normalized else explicit
+
+        // Everything is valid: build the SDK query.
+        var query: Query = if (isGroup) db.collectionGroup(path) else db.collection(collectionPath!!)
+        for (filter in filters) query = query.where(filter)
+        for (order in ordering) {
+            query = query.orderBy(order.path, if (order.descending) Query.Direction.DESCENDING else Query.Direction.ASCENDING)
+        }
+        limit?.let { (count, last) -> query = if (last) query.limitToLast(count) else query.limit(count) }
+        start?.let { query = if (it.inclusive) query.startAt(*it.values) else query.startAfter(*it.values) }
+        end?.let { query = if (it.inclusive) query.endAt(*it.values) else query.endBefore(*it.values) }
 
         return query
+    }
+
+    /**
+     * The ordering the SDK really applies: explicit clauses, then inequality
+     * fields not already ordered (in field-path order), then the document id,
+     * the implicit ones following the last explicit direction.
+     */
+    private fun normalizedOrder(explicit: List<OrderClause>, inequalityFields: List<String>): List<OrderClause> {
+        val ordered = explicit.map { it.field }.toSet()
+        val descending = explicit.lastOrNull()?.descending ?: false
+        val implicit = inequalityFields.distinct()
+            .filter { it != "__name__" && it !in ordered }
+            .sortedWith { a, b -> compareFieldPaths(a, b) }
+
+        val result = explicit.toMutableList()
+        implicit.forEach { result.add(OrderClause(it, NfsPaths.fieldPath(it), descending)) }
+        if ("__name__" !in ordered) result.add(OrderClause("__name__", FieldPath.documentId(), descending))
+        return result
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -772,56 +841,50 @@ internal object NfsQueryBuilder {
     }
 
     /**
-     * The SDK builds a document cursor from the document's value for every
-     * normalized order field; report a missing field or an uncommitted
-     * server timestamp as invalid-argument with a clear message.
+     * A value cursor lines up with the explicit orderBy clauses. A snapshot
+     * cursor ({document, values}) carries the snapshot's own value for every
+     * normalized order field, ending with its document: building the bound
+     * from those (instead of re-reading the document) keeps the cursor where
+     * the snapshot was even if the document has changed or been deleted.
      */
-    private fun validateCursorDocument(snapshot: DocumentSnapshot, fields: List<String>) {
-        for (field in fields) {
-            if (field == "__name__") continue
-            val path = NfsPaths.fieldPath(field)
-            if (!snapshot.contains(path)) {
-                throw NfsErrors.invalid("The cursor document [${snapshot.reference.path}] has no [$field] field, which the query is ordered by.")
-            }
-            if (snapshot.get(path, DocumentSnapshot.ServerTimestampBehavior.NONE) == null &&
-                snapshot.get(path, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) is Timestamp
-            ) {
-                throw NfsErrors.invalid("The cursor document [${snapshot.reference.path}] has a pending server timestamp in [$field], which the query is ordered by; wait for the write to commit.")
-            }
-        }
-    }
-
-    private fun applyCursor(query: Query, cursor: Map<String, Any?>, isStart: Boolean, orderFields: List<String>, normalizedFields: List<String>, db: FirebaseFirestore, collectionPath: String?): Query {
+    private fun cursorBound(cursor: Map<String, Any?>, explicit: List<OrderClause>, normalized: List<OrderClause>, db: FirebaseFirestore, collectionPath: String?): CursorBound {
         val inclusive = cursor["inclusive"] as? Boolean ?: true
+        val raw = cursor["values"] as? List<*> ?: throw NfsErrors.invalid(
+            if (cursor["document"] != null) "A document cursor needs the snapshot's value for each ordered field (the PHP API sends these)."
+            else "Cursor values must be a list.",
+        )
 
-        val documentPath = cursor["document"] as? String
-        if (documentPath != null) {
-            val snapshot = NfsRuntime.await(NfsPaths.document(documentPath, db).get(), "Reading the cursor document")
-            if (!snapshot.exists()) throw NfsErrors.invalid("Cursor document [$documentPath] does not exist.")
-            validateCursorDocument(snapshot, normalizedFields)
-            return when {
-                isStart && inclusive -> query.startAt(snapshot)
-                isStart -> query.startAfter(snapshot)
-                inclusive -> query.endAt(snapshot)
-                else -> query.endBefore(snapshot)
+        if (cursor["document"] != null) {
+            val reference = NfsPaths.document(cursor["document"] as? String ?: throw NfsErrors.invalid("Cursor document must be a path."), db)
+            if (raw.size != normalized.size) {
+                throw NfsErrors.invalid("The cursor for document [${reference.path}] needs one value per ordered field (${normalized.joinToString(", ") { it.field }}).")
             }
+            val values = normalized.mapIndexed { index, order ->
+                if (order.field == "__name__") {
+                    val slot = raw[index] as? Map<*, *>
+                    val slotPath = (slot?.get("path") as? String)?.let { runCatching { NfsPaths.segments(it).joinToString("/") }.getOrNull() }
+                    if (slot?.get("__type") != "reference" || slotPath != reference.path) {
+                        throw NfsErrors.invalid("The cursor for document [${reference.path}] must end in a reference to it.")
+                    }
+                    if (collectionPath != null && reference.parent.path != collectionPath) {
+                        throw NfsErrors.invalid("The cursor document [${reference.path}] is not in [$collectionPath].")
+                    }
+                    documentIdCursorValue(slot, collectionPath)
+                } else {
+                    NfsCodec.decode(raw[index], db, NfsContext.QUERY)
+                }
+            }
+            return CursorBound(values.toTypedArray(), inclusive, isSnapshot = true)
         }
 
-        val raw = (cursor["values"] as? List<*>) ?: emptyList<Any?>()
-        if (raw.isEmpty() || raw.size > orderFields.size) {
+        if (raw.isEmpty() || raw.size > explicit.size) {
             throw NfsErrors.invalid("Cursor values need a matching orderBy() clause for each value.")
         }
 
         val values = raw.mapIndexed { index, value ->
-            if (orderFields[index] == "__name__") documentIdCursorValue(value, collectionPath) else NfsCodec.decode(value, db, NfsContext.QUERY)
-        }.toTypedArray()
-
-        return when {
-            isStart && inclusive -> query.startAt(*values)
-            isStart -> query.startAfter(*values)
-            inclusive -> query.endAt(*values)
-            else -> query.endBefore(*values)
+            if (explicit[index].field == "__name__") documentIdCursorValue(value, collectionPath) else NfsCodec.decode(value, db, NfsContext.QUERY)
         }
+        return CursorBound(values.toTypedArray(), inclusive, isSnapshot = false)
     }
 }
 
@@ -970,6 +1033,7 @@ internal object NfsListeners {
                             "data" to document["data"],
                             "fromCache" to metadata["fromCache"],
                             "hasPendingWrites" to metadata["hasPendingWrites"],
+                            "pendingServerTimestamps" to metadata["pendingServerTimestamps"],
                         ),
                     )
                 } else {
@@ -1208,6 +1272,10 @@ internal object NfsTransactions {
 // MARK: - Auth helpers
 
 internal object NfsAuthSupport {
+    /** Empty credentials make the Auth SDK throw; report them like iOS does. */
+    fun required(payload: Map<String, Any?>, key: String): String =
+        (payload[key] as? String)?.takeIf { it.isNotEmpty() } ?: throw NfsErrors.invalid("FirebaseAuth needs a non-empty $key.")
+
     private var listener: FirebaseAuth.AuthStateListener? = null
     private val lock = ReentrantLock()
 

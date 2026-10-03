@@ -110,7 +110,8 @@ final class QueryRules
 
             if ($operator === 'array-contains-any') {
                 foreach ((array) $filter['value'] as $value) {
-                    if (is_array($value)) {
+                    // Tagged values (timestamps, references...) are arrays on the wire too.
+                    if (is_array($value) && array_is_list($value)) {
                         throw new InvalidArgumentException('array-contains-any values cannot be arrays (Firestore does not support nested arrays).');
                     }
                 }

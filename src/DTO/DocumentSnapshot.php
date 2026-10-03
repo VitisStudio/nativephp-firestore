@@ -27,7 +27,7 @@ final class DocumentSnapshot implements Arrayable
      * Build a snapshot from its wire form — the shape native code returns and
      * the shape event payloads carry.
      *
-     * @param  array{id?: string, path: string, exists?: bool, data?: array<string, mixed>|null, metadata?: array{fromCache?: bool, hasPendingWrites?: bool}}  $wire
+     * @param  array{id?: string, path: string, exists?: bool, data?: array<string, mixed>|null, metadata?: array{fromCache?: bool, hasPendingWrites?: bool, pendingServerTimestamps?: list<string>}}  $wire
      */
     public static function fromArray(array $wire): self
     {
@@ -86,6 +86,21 @@ final class DocumentSnapshot implements Arrayable
     public function hasPendingWrites(): bool
     {
         return $this->metadata->hasPendingWrites;
+    }
+
+    /**
+     * Whether the field (or something inside it) is a server timestamp that
+     * has not been committed yet, so its real value is still unknown.
+     */
+    public function hasPendingServerTimestamp(string $field): bool
+    {
+        foreach ($this->metadata->pendingServerTimestamps as $pending) {
+            if ($pending === $field || str_starts_with($pending, $field.'.')) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

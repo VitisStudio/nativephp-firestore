@@ -359,6 +359,10 @@ enum NFSPaths {
         return parts
     }
 
+    static func isDocumentPath(_ path: String) -> Bool {
+        path.split(separator: "/", omittingEmptySubsequences: false).count % 2 == 0
+    }
+
     static func document(_ path: String, _ db: Firestore) throws -> DocumentReference {
         let parts = try segments(path)
         guard parts.count % 2 == 0 else {
@@ -641,8 +645,32 @@ enum NFSCodec {
             "path": snapshot.reference.path,
             "exists": snapshot.exists,
             "data": snapshot.exists ? encodeMap(snapshot.data(with: behavior)) : NSNull(),
-            "metadata": metadata(snapshot.metadata),
+            "metadata": metadata(snapshot.metadata).merging(["pendingServerTimestamps": pendingServerTimestamps(snapshot)]) { $1 },
         ]
+    }
+
+    /// Fields holding a server timestamp the backend has not set yet: they
+    /// read as null without an estimate and as a timestamp with one. PHP
+    /// needs these to refuse such a snapshot as a query cursor.
+    static func pendingServerTimestamps(_ snapshot: DocumentSnapshot) -> [String] {
+        guard snapshot.exists, snapshot.metadata.hasPendingWrites,
+              let estimated = snapshot.data(with: .estimate), let raw = snapshot.data(with: .none) else {
+            return []
+        }
+
+        var pending: [String] = []
+        func walk(_ estimated: [String: Any], _ raw: [String: Any], _ prefix: String) {
+            for (key, value) in estimated {
+                let path = prefix.isEmpty ? key : "\(prefix).\(key)"
+                if value is Timestamp, raw[key] is NSNull {
+                    pending.append(path)
+                } else if let child = value as? [String: Any], let rawChild = raw[key] as? [String: Any] {
+                    walk(child, rawChild, path)
+                }
+            }
+        }
+        walk(estimated, raw, "")
+        return pending.sorted()
     }
 
     static func query(_ snapshot: QuerySnapshot) -> [String: Any] {
@@ -679,56 +707,121 @@ enum NFSCodec {
 enum NFSQueryBuilder {
     private static let maxDisjunctionValues = 30
 
+    /// The SDK checks each clause as it is added and reports a bad one with an
+    /// Objective-C exception, which Swift cannot catch. So the whole query
+    /// spec (filters including nested OR/AND, ordering, limit and cursors) is
+    /// decoded and validated first, and nothing touches the SDK query until
+    /// all of it has passed. PHP validates too, but the JavaScript bridge
+    /// wrappers reach this code directly.
     static func build(_ wire: [String: Any], _ db: Firestore) throws -> FirebaseFirestore.Query {
         let path = (wire["path"] as? String) ?? ""
         let isGroup = (wire["collectionGroup"] as? Bool) ?? false
+        let collectionPath: String? = isGroup ? nil : try NFSPaths.segments(path).joined(separator: "/")
 
-        var query: FirebaseFirestore.Query
         if isGroup {
             guard !path.isEmpty, !path.contains("/") else {
                 throw NFSError.invalid("Invalid collection group id [\(path)].")
             }
-            query = db.collectionGroup(path)
-        } else {
-            query = try NFSPaths.collection(path, db)
+        } else if let collectionPath, NFSPaths.isDocumentPath(collectionPath) {
+            throw NFSError.invalid("[\(path)] is not a collection path.")
         }
 
-        let filters = (wire["filters"] as? [[String: Any]]) ?? []
-        var stats = FilterStats()
-        for filter in filters {
-            query = query.whereFilter(try buildFilter(filter, db, collectionPath: isGroup ? nil : path, stats: &stats))
+        guard let rawFilters = (wire["filters"] ?? []) as? [[String: Any]] else {
+            throw NFSError.invalid("Query filters must be a list.")
         }
+        var stats = FilterStats()
+        let filters = try rawFilters.map { try buildFilter($0, db, collectionPath: collectionPath, stats: &stats) }
         try stats.validate()
 
-        let orderBy = (wire["orderBy"] as? [[String: Any]]) ?? []
-        for order in orderBy {
+        guard let rawOrder = (wire["orderBy"] ?? []) as? [[String: Any]] else {
+            throw NFSError.invalid("Query orderBy must be a list.")
+        }
+        let explicit = try rawOrder.map { order -> OrderClause in
             let field = (order["field"] as? String) ?? ""
-            query = query.order(by: try NFSPaths.fieldPath(field), descending: (order["direction"] as? String) == "desc")
-        }
-
-        if let limit = (wire["limit"] as? NSNumber)?.intValue {
-            guard limit > 0 else { throw NFSError.invalid("A query limit must be at least 1.") }
-            if (wire["limitType"] as? String) == "last" {
-                guard !orderBy.isEmpty else { throw NFSError.invalid("limitToLast() requires an orderBy() clause.") }
-                query = query.limit(toLast: limit)
-            } else {
-                query = query.limit(to: limit)
+            let direction = (order["direction"] as? String) ?? "asc"
+            guard direction == "asc" || direction == "desc" else {
+                throw NFSError.invalid("Order direction must be asc or desc.")
             }
+            return OrderClause(field: field, path: try NFSPaths.fieldPath(field), descending: direction == "desc")
         }
 
-        let orderFields = orderBy.compactMap { $0["field"] as? String }
-        let implicitFields = Array(Set(stats.inequalityFields))
-            .filter { $0 != "__name__" && !orderFields.contains($0) }
-            .sorted { $0.split(separator: ".", omittingEmptySubsequences: false).lexicographicallyPrecedes($1.split(separator: ".", omittingEmptySubsequences: false)) }
-        let cursorFields = CursorFields(explicit: orderFields, normalized: orderFields + implicitFields)
-        if let start = wire["startAt"] as? [String: Any] {
-            query = try applyCursor(query, start, edge: "start", fields: cursorFields, db: db, collectionPath: isGroup ? nil : path)
+        var limit: (count: Int, last: Bool)?
+        if let raw = wire["limit"], !(raw is NSNull) {
+            guard let number = raw as? NSNumber, number.doubleValue >= 1, number.doubleValue <= Double(Int32.max) else {
+                throw NFSError.invalid("A query limit must be a whole number from 1 to \(Int32.max).")
+            }
+            let isLast = (wire["limitType"] as? String) == "last"
+            if isLast && explicit.isEmpty {
+                throw NFSError.invalid("limitToLast() requires an orderBy() clause.")
+            }
+            limit = (number.intValue, isLast)
         }
-        if let end = wire["endAt"] as? [String: Any] {
-            query = try applyCursor(query, end, edge: "end", fields: cursorFields, db: db, collectionPath: isGroup ? nil : path)
+
+        let normalized = try normalizedOrder(explicit, inequalityFields: stats.inequalityFields)
+        let start = try (wire["startAt"] as? [String: Any]).map {
+            try cursorBound($0, explicit: explicit, normalized: normalized, db: db, collectionPath: collectionPath)
+        }
+        let end = try (wire["endAt"] as? [String: Any]).map {
+            try cursorBound($0, explicit: explicit, normalized: normalized, db: db, collectionPath: collectionPath)
+        }
+
+        // A snapshot cursor positions on the full normalized ordering, but
+        // value cursors may only cover explicit orderBy clauses, so the
+        // implicit ones are spelled out. The SDK normalizes the query to this
+        // same ordering anyway, so results and indexes are unchanged.
+        let ordering = (start?.isSnapshot ?? false) || (end?.isSnapshot ?? false) ? normalized : explicit
+
+        // Everything is valid: build the SDK query.
+        var query: FirebaseFirestore.Query = isGroup ? db.collectionGroup(path) : db.collection(collectionPath ?? path)
+        for filter in filters {
+            query = query.whereFilter(filter)
+        }
+        for order in ordering {
+            query = query.order(by: order.path, descending: order.descending)
+        }
+        if let limit {
+            query = limit.last ? query.limit(toLast: limit.count) : query.limit(to: limit.count)
+        }
+        if let start {
+            query = start.inclusive ? query.start(at: start.values) : query.start(after: start.values)
+        }
+        if let end {
+            query = end.inclusive ? query.end(at: end.values) : query.end(before: end.values)
         }
 
         return query
+    }
+
+    private struct OrderClause {
+        let field: String
+        let path: FieldPath
+        let descending: Bool
+    }
+
+    private struct CursorBound {
+        let values: [Any]
+        let inclusive: Bool
+        let isSnapshot: Bool
+    }
+
+    /// The ordering the SDK really applies: explicit clauses, then inequality
+    /// fields not already ordered (in field-path order), then the document
+    /// id, the implicit ones following the last explicit direction.
+    private static func normalizedOrder(_ explicit: [OrderClause], inequalityFields: [String]) throws -> [OrderClause] {
+        let ordered = Set(explicit.map { $0.field })
+        let descending = explicit.last?.descending ?? false
+        let implicit = Array(Set(inequalityFields))
+            .filter { $0 != "__name__" && !ordered.contains($0) }
+            .sorted { $0.split(separator: ".", omittingEmptySubsequences: false).lexicographicallyPrecedes($1.split(separator: ".", omittingEmptySubsequences: false)) }
+
+        var result = explicit
+        for field in implicit {
+            result.append(OrderClause(field: field, path: try NFSPaths.fieldPath(field), descending: descending))
+        }
+        if !ordered.contains("__name__") {
+            result.append(OrderClause(field: "__name__", path: FieldPath.documentID(), descending: descending))
+        }
+        return result
     }
 
     private struct FilterStats {
@@ -856,22 +949,6 @@ enum NFSQueryBuilder {
         return try NFSPaths.document(id, db)
     }
 
-    /// The SDK builds a document cursor from the document's value for every
-    /// normalized order field and raises an NSException (which Swift cannot
-    /// catch, so the app would crash) when one is missing or is a server
-    /// timestamp that has not been committed yet.
-    private static func validateCursorDocument(_ snapshot: DocumentSnapshot, fields: [String]) throws {
-        for field in fields where field != "__name__" {
-            let path = try NFSPaths.fieldPath(field)
-            guard let estimate = snapshot.get(path, serverTimestampBehavior: .estimate) else {
-                throw NFSError.invalid("The cursor document [\(snapshot.reference.path)] has no [\(field)] field, which the query is ordered by.")
-            }
-            if estimate is Timestamp, snapshot.get(path, serverTimestampBehavior: .none) is NSNull {
-                throw NFSError.invalid("The cursor document [\(snapshot.reference.path)] has a pending server timestamp in [\(field)], which the query is ordered by; wait for the write to commit.")
-            }
-        }
-    }
-
     /// Cursor values for a document-id ordering must be strings: a plain id
     /// for collection queries, a full document path for collection groups.
     private static func documentIdCursorValue(_ value: Any, collectionPath: String?) throws -> String {
@@ -891,48 +968,59 @@ enum NFSQueryBuilder {
         return id
     }
 
-    /// Explicit orderBy fields (what value cursors line up with) and the
-    /// normalized ordering the SDK builds document cursors from: explicit
-    /// fields, then unordered inequality fields, then the document id.
-    private struct CursorFields {
-        let explicit: [String]
-        let normalized: [String]
-    }
-
-    private static func applyCursor(_ query: FirebaseFirestore.Query, _ cursor: [String: Any], edge: String, fields: CursorFields, db: Firestore, collectionPath: String?) throws -> FirebaseFirestore.Query {
+    /// A value cursor lines up with the explicit orderBy clauses. A snapshot
+    /// cursor ({document, values}) carries the snapshot's own value for every
+    /// normalized order field, ending with its document: building the bound
+    /// from those (instead of re-reading the document) keeps the cursor where
+    /// the snapshot was even if the document has changed or been deleted.
+    private static func cursorBound(_ cursor: [String: Any], explicit: [OrderClause], normalized: [OrderClause], db: Firestore, collectionPath: String?) throws -> CursorBound {
         let inclusive = (cursor["inclusive"] as? Bool) ?? true
-        let orderFields = fields.explicit
-
-        if let path = cursor["document"] as? String {
-            let snapshot = try NFSOperations.fetch(try NFSPaths.document(path, db), source: .default)
-            guard snapshot.exists else {
-                throw NFSError.invalid("Cursor document [\(path)] does not exist.")
-            }
-            try validateCursorDocument(snapshot, fields: fields.normalized)
-            if edge == "start" {
-                return inclusive ? query.start(atDocument: snapshot) : query.start(afterDocument: snapshot)
-            }
-            return inclusive ? query.end(atDocument: snapshot) : query.end(beforeDocument: snapshot)
+        guard let rawValues = cursor["values"] as? [Any] else {
+            throw NFSError.invalid(cursor["document"] != nil
+                ? "A document cursor needs the snapshot's value for each ordered field (the PHP API sends these)."
+                : "Cursor values must be a list.")
         }
 
-        let rawValues = (cursor["values"] as? [Any]) ?? []
-        guard !rawValues.isEmpty, rawValues.count <= orderFields.count else {
+        if let document = cursor["document"] {
+            guard let documentPath = document as? String else {
+                throw NFSError.invalid("Cursor document must be a path.")
+            }
+            let reference = try NFSPaths.document(documentPath, db)
+            guard rawValues.count == normalized.count else {
+                throw NFSError.invalid("The cursor for document [\(reference.path)] needs one value per ordered field (\(normalized.map { $0.field }.joined(separator: ", "))).")
+            }
+
+            var values: [Any] = []
+            for (index, order) in normalized.enumerated() {
+                if order.field == "__name__" {
+                    guard let map = rawValues[index] as? [String: Any], (map["__type"] as? String) == "reference",
+                          let slot = map["path"] as? String, (try? NFSPaths.segments(slot).joined(separator: "/")) == reference.path else {
+                        throw NFSError.invalid("The cursor for document [\(reference.path)] must end in a reference to it.")
+                    }
+                    if let collectionPath, reference.parent.path != collectionPath {
+                        throw NFSError.invalid("The cursor document [\(reference.path)] is not in [\(collectionPath)].")
+                    }
+                    values.append(try documentIdCursorValue(map, collectionPath: collectionPath))
+                } else {
+                    values.append(try NFSCodec.decode(rawValues[index], db, context: .query))
+                }
+            }
+            return CursorBound(values: values, inclusive: inclusive, isSnapshot: true)
+        }
+
+        guard !rawValues.isEmpty, rawValues.count <= explicit.count else {
             throw NFSError.invalid("Cursor values need a matching orderBy() clause for each value.")
         }
 
         var values: [Any] = []
         for (index, value) in rawValues.enumerated() {
-            if orderFields[index] == "__name__" {
+            if explicit[index].field == "__name__" {
                 values.append(try documentIdCursorValue(value, collectionPath: collectionPath))
             } else {
                 values.append(try NFSCodec.decode(value, db, context: .query))
             }
         }
-
-        if edge == "start" {
-            return inclusive ? query.start(at: values) : query.start(after: values)
-        }
-        return inclusive ? query.end(at: values) : query.end(before: values)
+        return CursorBound(values: values, inclusive: inclusive, isSnapshot: false)
     }
 }
 
@@ -1151,6 +1239,7 @@ final class NFSListeners {
                     payload["listenerId"] = id
                     payload["fromCache"] = metadata["fromCache"] ?? false
                     payload["hasPendingWrites"] = metadata["hasPendingWrites"] ?? false
+                    payload["pendingServerTimestamps"] = metadata["pendingServerTimestamps"] ?? []
                     NFSBridge.dispatch("VitisStudio\\NativeFirestore\\Events\\DocumentChanged", payload)
                 } else {
                     self?.fail(id, error)
@@ -1398,6 +1487,15 @@ final class NFSTransactions {
 // MARK: - Auth helpers
 
 enum NFSAuthSupport {
+    /// The Auth SDKs reject empty credentials (Android by throwing), so every
+    /// platform reports them the same way before calling the SDK.
+    static func required(_ payload: [String: Any], _ key: String) throws -> String {
+        guard let value = payload[key] as? String, !value.isEmpty else {
+            throw NFSError.invalid("FirebaseAuth needs a non-empty \(key).")
+        }
+        return value
+    }
+
     static func encode(_ user: User?) -> Any {
         guard let user else { return NSNull() }
         return [

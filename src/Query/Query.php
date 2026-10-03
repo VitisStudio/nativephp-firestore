@@ -198,19 +198,50 @@ class Query
 
         QueryRules::validate($wire);
 
-        foreach ($this->cursorSnapshots as $snapshot) {
-            $missing = QueryRules::missingCursorFields($wire, fn (string $field) => Arr::has($snapshot->data() ?? [], $field));
+        foreach ($this->cursorSnapshots as $edge => $snapshot) {
+            $wire[$edge === 'start' ? 'startAt' : 'endAt']['values'] = $this->snapshotCursorValues($wire, $snapshot);
+        }
 
-            if ($missing !== []) {
+        return $wire;
+    }
+
+    /**
+     * The snapshot's value for every field the query is really ordered by,
+     * ending with its document reference. Sending these (rather than having
+     * the device re-read the document) keeps the cursor where the snapshot
+     * was, even if the document has changed or been deleted since.
+     *
+     * @param  array<string, mixed>  $wire
+     * @return list<mixed>
+     */
+    private function snapshotCursorValues(array $wire, DocumentSnapshot $snapshot): array
+    {
+        $missing = QueryRules::missingCursorFields($wire, fn (string $field) => Arr::has($snapshot->data() ?? [], $field));
+
+        if ($missing !== []) {
+            throw new InvalidArgumentException(sprintf(
+                'The cursor document [%s] has no [%s] field, which the query is ordered by.',
+                $snapshot->path,
+                implode(', ', $missing),
+            ));
+        }
+
+        $orderBy = QueryRules::normalizedOrderBy($wire);
+
+        foreach ($orderBy as $order) {
+            if ($order['field'] !== '__name__' && $snapshot->hasPendingServerTimestamp($order['field'])) {
                 throw new InvalidArgumentException(sprintf(
-                    'The cursor document [%s] has no [%s] field, which the query is ordered by.',
+                    'The cursor document [%s] has a pending server timestamp in [%s], which the query is ordered by; wait for the write to commit.',
                     $snapshot->path,
-                    implode(', ', $missing),
+                    $order['field'],
                 ));
             }
         }
 
-        return $wire;
+        return array_map(
+            fn (array $order) => ValueCodec::encodeArgument($order['field'] === '__name__' ? $snapshot->reference() : $snapshot->get($order['field'])),
+            $orderBy,
+        );
     }
 
     protected function client(): FirestoreClient

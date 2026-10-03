@@ -16,6 +16,7 @@ class DocumentChanged implements BroadcastsGlobally
 
     /**
      * @param  array<string, mixed>|null  $data  wire-encoded; use snapshot() for decoded values
+     * @param  list<string>  $pendingServerTimestamps  fields whose server timestamp has not committed yet
      */
     public function __construct(
         public string $listenerId,
@@ -25,6 +26,7 @@ class DocumentChanged implements BroadcastsGlobally
         public ?array $data = null,
         public bool $fromCache = false,
         public bool $hasPendingWrites = false,
+        public array $pendingServerTimestamps = [],
     ) {}
 
     public function snapshot(): DocumentSnapshot
@@ -34,7 +36,7 @@ class DocumentChanged implements BroadcastsGlobally
             'path' => $this->path,
             'exists' => $this->exists,
             'data' => $this->data,
-            'metadata' => ['fromCache' => $this->fromCache, 'hasPendingWrites' => $this->hasPendingWrites],
+            'metadata' => ['fromCache' => $this->fromCache, 'hasPendingWrites' => $this->hasPendingWrites, 'pendingServerTimestamps' => $this->pendingServerTimestamps],
         ]);
     }
 }

@@ -15,7 +15,7 @@ object FirebaseAuthFunctions {
         override fun execute(parameters: Map<String, Any>): Map<String, Any> =
             NfsBridge.handle(parameters) { payload ->
                 val result = NfsRuntime.await(
-                    NfsRuntime.auth().signInWithEmailAndPassword(payload["email"] as? String ?: "", payload["password"] as? String ?: ""),
+                    NfsRuntime.auth().signInWithEmailAndPassword(NfsAuthSupport.required(payload, "email"), NfsAuthSupport.required(payload, "password")),
                     "Sign-in",
                 )
                 mapOf("user" to NfsAuthSupport.encode(result.user))
@@ -28,7 +28,7 @@ object FirebaseAuthFunctions {
         override fun execute(parameters: Map<String, Any>): Map<String, Any> =
             NfsBridge.handle(parameters) { payload ->
                 val result = NfsRuntime.await(
-                    NfsRuntime.auth().createUserWithEmailAndPassword(payload["email"] as? String ?: "", payload["password"] as? String ?: ""),
+                    NfsRuntime.auth().createUserWithEmailAndPassword(NfsAuthSupport.required(payload, "email"), NfsAuthSupport.required(payload, "password")),
                     "Creating the account",
                 )
                 mapOf("user" to NfsAuthSupport.encode(result.user))
@@ -82,7 +82,7 @@ object FirebaseAuthFunctions {
 
         override fun execute(parameters: Map<String, Any>): Map<String, Any> =
             NfsBridge.handle(parameters) { payload ->
-                NfsRuntime.await(NfsRuntime.auth().sendPasswordResetEmail(payload["email"] as? String ?: ""), "Sending the password reset email")
+                NfsRuntime.await(NfsRuntime.auth().sendPasswordResetEmail(NfsAuthSupport.required(payload, "email")), "Sending the password reset email")
                 mapOf("sent" to true)
             }
     }
