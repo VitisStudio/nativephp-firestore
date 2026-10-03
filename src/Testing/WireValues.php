@@ -3,6 +3,7 @@
 namespace VitisStudio\NativeFirestore\Testing;
 
 use stdClass;
+use VitisStudio\NativeFirestore\Support\ValueCodec;
 
 /**
  * Firestore's value ordering and equality, applied to wire-format values,
@@ -139,6 +140,26 @@ final class WireValues
             is_infinite($value) => ['__type' => 'double', 'value' => $value > 0 ? 'Infinity' : '-Infinity'],
             default => $value,
         };
+    }
+
+    /**
+     * A double as the native encoders send it to PHP: whole values (-0.0
+     * included) travel tagged, because the platform JSON writers print 1.0 as
+     * `1`, which PHP would read back as an integer.
+     *
+     * @return float|array{__type: string, value: string}
+     */
+    public static function nativeDouble(float $value): float|array
+    {
+        if (! is_finite($value)) {
+            return self::double($value);
+        }
+
+        if ($value !== floor($value)) {
+            return $value;
+        }
+
+        return ['__type' => 'double', 'value' => ValueCodec::doubleText($value)];
     }
 
     /**

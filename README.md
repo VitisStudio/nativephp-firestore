@@ -210,7 +210,7 @@ Firestore::collection('users')->add(['name' => 'Grace']); // auto id, returns th
 
 | PHP | Firestore |
 |---|---|
-| `null`, `bool`, `int`, `float`, `string` | same (`10.0` stays a double) |
+| `null`, `bool`, `int`, `float`, `string` | same (`10.0` and `-0.0` stay doubles and read back as `float`; ints stay ints) |
 | list arrays / associative arrays | array / map (`[]` is an empty array; use `new MapValue`, `new stdClass` or `(object) []` for an empty map) |
 | `DTO\MapValue`, `stdClass` | map (always, even when empty or keyed `"0"`, `"1"`, …) |
 | `DTO\Timestamp`, any `DateTimeInterface` | timestamp (read back as `Timestamp`; `->toDateTime()` gives Carbon) |

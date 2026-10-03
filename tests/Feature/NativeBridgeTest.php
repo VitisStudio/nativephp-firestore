@@ -241,3 +241,56 @@ it('returns auth users from the bridge', function () {
         ->and(FirebaseAuth::getIdToken(true))->toBe('jwt')
         ->and(payloadOf($this->bridge->callsTo('FirebaseAuth.GetIdToken')[0]))->toBe(['forceRefresh' => true]);
 });
+
+it('keeps whole-valued doubles doubles from native results through cursors and write-back', function () {
+    // The shape the native encoders produce: whole doubles tagged at any depth,
+    // because Foundation and org.json would print 1.0 as `1`.
+    $one = '{"__type":"double","value":"1.0"}';
+    $negZero = '{"__type":"double","value":"-0.0"}';
+    $this->bridge->respondTo('Firestore.GetDocument', ['result' => '{"id":"n1","path":"notes/n1","exists":true,'
+        .'"data":{"x":'.$one.',"z":'.$negZero.',"half":1.5,"big":9007199254740993,"n":1,'
+        .'"tags":['.$one.',1],"m":{"k":'.$one.'},"tm":{"__type":"map","value":{"0":'.$one.'}}},'
+        .'"metadata":{"fromCache":false,"hasPendingWrites":false,"pendingServerTimestamps":[]}}']);
+    $this->bridge->respondTo('Firestore.RunQuery', nativeResult(['documents' => [], 'changes' => [], 'metadata' => ['fromCache' => false, 'hasPendingWrites' => false]]));
+    $this->bridge->respondTo('Firestore.Commit', nativeResult(['committed' => 1]));
+
+    $snapshot = Firestore::doc('notes/n1')->get();
+
+    expect($snapshot->data())->toEqual([
+        'x' => 1.0, 'z' => -0.0, 'half' => 1.5, 'big' => 9007199254740993, 'n' => 1,
+        'tags' => [1.0, 1], 'm' => ['k' => 1.0], 'tm' => new MapValue([1.0]),
+    ])
+        ->and($snapshot->get('x'))->toBe(1.0)
+        ->and(fdiv(1, $snapshot->get('z')))->toBe(-INF)
+        ->and($snapshot->get('tags'))->toBe([1.0, 1])
+        ->and($snapshot->get('m.k'))->toBe(1.0)
+        ->and($snapshot->get('tm')->toArray())->toBe([1.0]);
+
+    Firestore::collection('notes')->orderBy('x')->orderBy('z')->startAfter($snapshot)->get();
+    Firestore::collection('notes')->whereArrayContains('tags', $snapshot->get('tags')[0])->get();
+    Firestore::doc('notes/copy')->set($snapshot->data());
+
+    $queries = $this->bridge->callsTo('Firestore.RunQuery');
+    $write = json_decode($this->bridge->callsTo('Firestore.Commit')[0]['params']['payload'])->writes[0]->data;
+
+    expect(ValueCodec::json(json_decode($queries[0]['params']['payload'])->query->startAt->values))
+        ->toBe('[{"__type":"double","value":"1.0"},{"__type":"double","value":"-0.0"},{"__type":"reference","path":"notes/n1"}]')
+        ->and(ValueCodec::json(json_decode($queries[1]['params']['payload'])->query->filters[0]->value))->toBe('1.0')
+        ->and(ValueCodec::json($write))->toBe('{"x":1.0,"z":-0.0,"half":1.5,"big":9007199254740993,"n":1,"tags":[1.0,1],"m":{"k":1.0},"tm":{"0":1.0}}');
+});
+
+it('decodes whole-valued doubles in event payloads', function () {
+    $payload = json_decode('{"listenerId":"L1","path":"notes","documents":[{"id":"n1","path":"notes/n1","exists":true,'
+        .'"data":{"x":{"__type":"double","value":"1.0"},"l":[{"__type":"double","value":"-0.0"}],"n":2},"metadata":{"fromCache":false,"hasPendingWrites":false}}],'
+        .'"changes":[{"type":"added","document":{"id":"n1","path":"notes/n1","exists":true,"data":{"m":{"__type":"map","value":{"0":{"__type":"double","value":"2.0"}}}},'
+        .'"metadata":{"fromCache":false,"hasPendingWrites":false}},"oldIndex":-1,"newIndex":0}],"fromCache":false,"hasPendingWrites":false}', true);
+
+    $snapshot = (new QuerySnapshotChanged(...$payload))->snapshot();
+    $document = (new DocumentChanged(listenerId: 'L2', path: 'notes/n1', id: 'n1', exists: true, data: $payload['documents'][0]['data']))->snapshot();
+
+    expect($snapshot->first()->get('x'))->toBe(1.0)
+        ->and(fdiv(1, $snapshot->first()->get('l')[0]))->toBe(-INF)
+        ->and($snapshot->first()->get('n'))->toBe(2)
+        ->and($snapshot->docChanges()[0]->document->get('m')->toArray())->toBe([2.0])
+        ->and($document->get('x'))->toBe(1.0);
+});

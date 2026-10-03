@@ -529,7 +529,10 @@ enum NFSCodec {
             case "NaN": return Double.nan
             case "Infinity": return Double.infinity
             case "-Infinity": return -Double.infinity
-            default: return (map["value"] as? NSNumber)?.doubleValue ?? Double.nan
+            default:
+                if let text = map["value"] as? String, let parsed = Double(text) { return parsed }
+                if let number = map["value"] as? NSNumber { return number.doubleValue }
+                throw NFSError.invalid("Invalid value for a tagged double.")
             }
 
         case "fieldvalue":
@@ -613,9 +616,7 @@ enum NFSCodec {
         if let number = value as? NSNumber {
             let decoded = numeric(number)
             if let double = decoded as? Double {
-                if double.isNaN { return ["__type": "double", "value": "NaN"] }
-                if double.isInfinite { return ["__type": "double", "value": double > 0 ? "Infinity" : "-Infinity"] }
-                return double
+                return encodeDouble(double)
             }
             return decoded
         }
@@ -633,6 +634,17 @@ enum NFSCodec {
         }
 
         return String(describing: value)
+    }
+
+    // JSONSerialization writes 1.0 as `1` and -0.0 as `-0`, which PHP reads
+    // back as integers, so whole-valued doubles travel tagged like NaN and the
+    // infinities do. A double with a fraction stays a plain JSON number: its
+    // text always carries a "." or an exponent, so PHP reads it as a float.
+    static func encodeDouble(_ double: Double) -> Any {
+        if double.isNaN { return ["__type": "double", "value": "NaN"] }
+        if double.isInfinite { return ["__type": "double", "value": double > 0 ? "Infinity" : "-Infinity"] }
+        if double == double.rounded(.towardZero) { return ["__type": "double", "value": String(double)] }
+        return double
     }
 
     static func isListLike(_ map: [String: Any]) -> Bool {

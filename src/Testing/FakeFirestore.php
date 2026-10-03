@@ -1222,7 +1222,8 @@ class FakeFirestore implements FirestoreDriver
 
     /**
      * Stored document data as native code sends it: nested maps that PHP
-     * would mistake for lists (empty, or keyed "0".."n-1") tagged as maps.
+     * would mistake for lists (empty, or keyed "0".."n-1") tagged as maps,
+     * and whole-valued doubles tagged so they stay doubles.
      */
     private function nativeData(stdClass $data): stdClass
     {
@@ -1237,6 +1238,10 @@ class FakeFirestore implements FirestoreDriver
 
     private function nativeValue(mixed $value): mixed
     {
+        if (is_float($value)) {
+            return WireValues::nativeDouble($value);
+        }
+
         if (is_array($value)) {
             return WireValues::isTagged($value) ? $value : array_map($this->nativeValue(...), $value);
         }

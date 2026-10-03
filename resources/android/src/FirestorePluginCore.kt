@@ -446,6 +446,16 @@ internal enum class NfsContext {
 internal val NFS_TIMESTAMP_SECONDS_RANGE = -62_135_596_800L..253_402_300_799L
 
 internal object NfsCodec {
+    // org.json writes 1.0 as `1` and -0.0 as `-0`, which PHP reads back as
+    // integers, so whole-valued doubles travel tagged like NaN and the
+    // infinities do. A double with a fraction stays a plain JSON number: its
+    // text always carries a "." or an exponent, so PHP reads it as a float.
+    fun encodeDouble(value: Double): Any = when {
+        value.isNaN() || value.isInfinite() -> taggedDouble(value)
+        value == Math.rint(value) -> mapOf("__type" to "double", "value" to value.toString())
+        else -> value
+    }
+
     fun taggedDouble(value: Double): Map<String, Any?> = mapOf(
         "__type" to "double",
         "value" to when {
@@ -519,7 +529,11 @@ internal object NfsCodec {
                 "NaN" -> Double.NaN
                 "Infinity" -> Double.POSITIVE_INFINITY
                 "-Infinity" -> Double.NEGATIVE_INFINITY
-                else -> (map["value"] as? Number)?.toDouble() ?: Double.NaN
+                else -> when (val raw = map["value"]) {
+                    is String -> raw.toDoubleOrNull() ?: throw NfsErrors.invalid("Invalid value for a tagged double.")
+                    is Number -> raw.toDouble()
+                    else -> throw NfsErrors.invalid("Invalid value for a tagged double.")
+                }
             }
             "fieldvalue" -> decodeSentinel(map, db, context, depth, underArray)
             else -> map.entries.associate {
@@ -566,7 +580,7 @@ internal object NfsCodec {
         is Blob -> mapOf("__type" to "bytes", "base64" to Base64.encodeToString(value.toBytes(), Base64.NO_WRAP))
         is Boolean, is String, is Long -> value
         is Int -> value.toLong()
-        is Double -> if (value.isNaN() || value.isInfinite()) taggedDouble(value) else value
+        is Double -> encodeDouble(value)
         is Float -> encode(value.toDouble())
         is Number -> value.toLong()
         is List<*> -> value.map { encode(it) }

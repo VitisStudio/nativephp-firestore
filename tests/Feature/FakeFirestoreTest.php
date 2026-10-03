@@ -888,6 +888,39 @@ describe('SDK fidelity', function () {
             ->and($ids($items->where('tags', 'array-contains-any', [1])))->toBe(['a']);
     });
 
+    it('sends whole-valued doubles tagged, as the native encoders do, so they stay doubles', function () {
+        Event::fake([QuerySnapshotChanged::class, DocumentChanged::class]);
+        $this->fake->seed('t/a', ['x' => 1.0, 'z' => -0.0, 'n' => 1, 'big' => 9007199254740993, 'tags' => [1.0], 'm' => ['k' => 2.0], 'tm' => new MapValue([3.0])]);
+        $this->fake->seed('t/b', ['tags' => [1]]);
+        Firestore::collection('t')->listen();
+        Firestore::doc('t/a')->listen();
+
+        $snapshot = Firestore::doc('t/a')->get();
+        $query = Event::dispatched(QuerySnapshotChanged::class)->map(fn (array $args) => $args[0])->last();
+        $event = Event::dispatched(DocumentChanged::class)->map(fn (array $args) => $args[0])->last();
+        $data = ['x' => 1.0, 'z' => -0.0, 'n' => 1, 'big' => 9007199254740993, 'tags' => [1.0], 'm' => ['k' => 2.0], 'tm' => new MapValue([3.0])];
+
+        expect($snapshot->wireField('x'))->toBe([true, ['__type' => 'double', 'value' => '1.0']])
+            ->and($snapshot->wireField('z'))->toBe([true, ['__type' => 'double', 'value' => '-0.0']])
+            ->and($snapshot->wireField('n'))->toBe([true, 1])
+            ->and($snapshot->wireField('m.k'))->toBe([true, ['__type' => 'double', 'value' => '2.0']])
+            ->and($event->data['x'])->toBe(['__type' => 'double', 'value' => '1.0'])
+            ->and($event->data['tm'])->toBe(['__type' => 'map', 'value' => [['__type' => 'double', 'value' => '3.0']]])
+            ->and($snapshot->data())->toEqual($data)
+            ->and($event->snapshot()->data())->toEqual($data)
+            ->and($query->snapshot()->first()->data())->toEqual($data)
+            ->and($query->snapshot()->docChanges()[0]->document->get('tags'))->toBe([1.0])
+            ->and(fdiv(1, $snapshot->get('z')))->toBe(-INF);
+
+        $matches = Firestore::collection('t')->whereArrayContains('tags', $snapshot->get('tags')[0])->get();
+        Firestore::doc('t/copy')->set($snapshot->data());
+
+        expect(array_map(fn ($document) => $document->id(), $matches->documents()))->toBe(['a'])
+            ->and(Firestore::collection('t')->orderBy('x')->startAt($snapshot)->get()->first()->id())->toBe('a')
+            ->and($this->fake->document('t/copy'))->toEqual($data)
+            ->and($this->fake->document('t/copy')['x'])->toBe(1.0);
+    });
+
     it('still matches 1 and 1.0 with == and excludes both with !=, which use Compare', function () {
         $this->fake->seed('t/a', ['x' => 1]);
         $this->fake->seed('t/b', ['x' => 1.0]);

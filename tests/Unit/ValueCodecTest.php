@@ -21,6 +21,28 @@ it('keeps whole floats as doubles on the wire', function () {
     expect(ValueCodec::json(['price' => 10.0]))->toBe('{"price":10.0}');
 });
 
+it('decodes the tagged doubles native code sends for whole values, keeping the sign of zero', function () {
+    // Swift prints String(1e300) as "1e+300", Kotlin as "1.0E300".
+    $decoded = ValueCodec::decodeMap(ValueCodec::fromJson('{"one":{"__type":"double","value":"1.0"},'
+        .'"negZero":{"__type":"double","value":"-0.0"},"swiftBig":{"__type":"double","value":"1e+300"},'
+        .'"kotlinBig":{"__type":"double","value":"1.0E300"},"half":0.5,"big":9007199254740993,"int":1}'));
+
+    expect($decoded['one'])->toBe(1.0)
+        ->and($decoded['negZero'])->toBe(-0.0)
+        ->and(fdiv(1, $decoded['negZero']))->toBe(-INF)
+        ->and($decoded['swiftBig'])->toBe(1e300)
+        ->and($decoded['kotlinBig'])->toBe(1e300)
+        ->and($decoded['half'])->toBe(0.5)
+        ->and($decoded['big'])->toBe(9007199254740993)
+        ->and($decoded['int'])->toBe(1)
+        ->and(fn () => ValueCodec::decode(['__type' => 'double', 'value' => 'one']))->toThrow(InvalidArgumentException::class);
+});
+
+it('sends floats as JSON doubles and integers as integers, whatever their size', function () {
+    expect(ValueCodec::json(ValueCodec::encodeMap(['one' => 1.0, 'negZero' => -0.0, 'big' => 9007199254740993, 'list' => [2.0, 2], 'map' => new MapValue([3.0])])))
+        ->toBe('{"one":1.0,"negZero":-0.0,"big":9007199254740993,"list":[2.0,2],"map":{"0":3.0}}');
+});
+
 it('tags Firestore types', function () {
     $encoded = ValueCodec::encode([
         'at' => new Timestamp(1700000000, 5),

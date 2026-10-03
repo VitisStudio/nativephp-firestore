@@ -20,6 +20,16 @@ use VitisStudio\NativeFirestore\Query\DocumentReference;
  * back. Firestore types that JSON cannot express travel as tagged maps:
  * {"__type": "timestamp" | "geopoint" | "reference" | "bytes" | "fieldvalue" | "double" | "map", ...}.
  *
+ * Doubles: native code tags every whole-valued double, -0.0 included, as
+ * {"__type": "double", "value": "1.0"} (the platform JSON writers print 1.0
+ * as `1`, which PHP would read as an integer), and NaN/Infinity/-Infinity the
+ * same way. A double with a fraction travels as a plain JSON number, whose
+ * text always has a "." or an exponent, so it decodes as a float. PHP sends
+ * finite floats as plain numbers, written with JSON_PRESERVE_ZERO_FRACTION
+ * (1.0 stays `1.0`, -0.0 stays `-0.0`), which both native JSON parsers read
+ * as doubles; integers stay integers both ways. Native decoders also accept
+ * the tagged form, so a snapshot value echoed back as a cursor keeps its type.
+ *
  * Native code sends a map that a PHP array would mistake for a list (empty,
  * or keyed exactly "0".."n-1") as {"__type": "map", "value": {...}}, so it
  * stays a map however the JSON is decoded; decode() turns it into a
@@ -392,12 +402,7 @@ final class ValueCodec
             'geopoint' => new GeoPoint((float) $value['latitude'], (float) $value['longitude']),
             'reference' => new DocumentReference((string) $value['path']),
             'bytes' => Bytes::fromBase64((string) $value['base64']),
-            'double' => match ($value['value']) {
-                'NaN' => NAN,
-                'Infinity' => INF,
-                '-Infinity' => -INF,
-                default => (float) $value['value'],
-            },
+            'double' => self::decodeDouble($value['value'] ?? null),
             self::TYPE_MAP => self::decodeTaggedMap((array) ($value['value'] ?? [])),
             default => array_map(self::decode(...), $value),
         };
@@ -412,6 +417,31 @@ final class ValueCodec
         $decoded = array_map(self::decode(...), $entries);
 
         return MapValue::isAmbiguous($decoded) ? new MapValue($decoded) : $decoded;
+    }
+
+    /**
+     * The value of a tagged double: "NaN", "Infinity", "-Infinity" or the
+     * decimal text of a finite double ("1.0", "-0.0", "1e+300").
+     */
+    public static function decodeDouble(mixed $value): float
+    {
+        return match (true) {
+            $value === 'NaN' => NAN,
+            $value === 'Infinity' => INF,
+            $value === '-Infinity' => -INF,
+            is_int($value), is_float($value) => (float) $value,
+            is_string($value) && is_numeric($value) => (float) $value,
+            default => throw new InvalidArgumentException('Invalid value for a tagged double.'),
+        };
+    }
+
+    /**
+     * The decimal text of a finite double that reads back as the same
+     * double, keeping the sign of -0.0 ("1.0", "-0.0", "1.0e+300").
+     */
+    public static function doubleText(float $value): string
+    {
+        return json_encode($value, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
     }
 
     private static function encodeFloat(float $value): float|array
