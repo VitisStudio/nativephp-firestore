@@ -40,7 +40,7 @@ struct NFSError: Error {
             return NFSError(code: NFSError.firestoreCode(nsError.code), message: nsError.localizedDescription)
         }
 
-        if nsError.domain == AuthErrorDomain {
+        if nsError.domain == "FIRAuthErrorDomain" {
             let name = (nsError.userInfo["FIRAuthErrorUserInfoNameKey"] as? String) ?? "ERROR_UNKNOWN"
             let code = name.replacingOccurrences(of: "ERROR_", with: "").lowercased().replacingOccurrences(of: "_", with: "-")
             return NFSError(code: code, message: nsError.localizedDescription)
