@@ -2,10 +2,12 @@
 
 namespace VitisStudio\NativeFirestore\Query;
 
+use Illuminate\Support\Arr;
 use InvalidArgumentException;
 use VitisStudio\NativeFirestore\DTO\DocumentSnapshot;
 use VitisStudio\NativeFirestore\DTO\QuerySnapshot;
 use VitisStudio\NativeFirestore\FirestoreClient;
+use VitisStudio\NativeFirestore\Support\QueryRules;
 use VitisStudio\NativeFirestore\Support\ValueCodec;
 
 /**
@@ -29,6 +31,9 @@ class Query
 
     /** @var array{values?: list<mixed>, document?: string, inclusive: bool}|null */
     protected ?array $endCursor = null;
+
+    /** @var array{start?: DocumentSnapshot, end?: DocumentSnapshot} */
+    protected array $cursorSnapshots = [];
 
     public function __construct(
         protected readonly string $path,
@@ -180,11 +185,7 @@ class Query
      */
     public function toWire(): array
     {
-        if ($this->limitType === 'last' && $this->limit !== null && $this->orderBy === []) {
-            throw new InvalidArgumentException('limitToLast() requires at least one orderBy() clause.');
-        }
-
-        return [
+        $wire = [
             'path' => $this->path,
             'collectionGroup' => $this->collectionGroup,
             'filters' => array_map(fn (Filter $filter) => $filter->toWire(), $this->filters),
@@ -194,6 +195,22 @@ class Query
             'startAt' => $this->startCursor,
             'endAt' => $this->endCursor,
         ];
+
+        QueryRules::validate($wire);
+
+        foreach ($this->cursorSnapshots as $snapshot) {
+            $missing = QueryRules::missingCursorFields($wire, fn (string $field) => Arr::has($snapshot->data() ?? [], $field));
+
+            if ($missing !== []) {
+                throw new InvalidArgumentException(sprintf(
+                    'The cursor document [%s] has no [%s] field, which the query is ordered by.',
+                    $snapshot->path,
+                    implode(', ', $missing),
+                ));
+            }
+        }
+
+        return $wire;
     }
 
     protected function client(): FirestoreClient
@@ -229,11 +246,18 @@ class Query
             }
 
             $cursor = ['document' => $values[0]->path, 'inclusive' => $inclusive];
+            $snapshot = $values[0];
         } else {
             $cursor = ['values' => array_map(ValueCodec::encode(...), array_values($values)), 'inclusive' => $inclusive];
+            $snapshot = null;
         }
 
         $query = clone $this;
+        unset($query->cursorSnapshots[$edge]);
+
+        if ($snapshot !== null) {
+            $query->cursorSnapshots[$edge] = $snapshot;
+        }
 
         if ($edge === 'start') {
             $query->startCursor = $cursor;

@@ -588,10 +588,12 @@ internal object NfsQueryBuilder {
         var notIn = 0
         var notEqual = 0
         var hasOr = false
+        val inequalityFields = mutableListOf<String>()
 
         fun validate() {
             if (arrayContains > 1) throw NfsErrors.invalid("A query can use at most one array-contains or array-contains-any filter.")
             if (notIn > 1) throw NfsErrors.invalid("A query can use at most one not-in filter.")
+            if (notEqual > 1) throw NfsErrors.invalid("A query can use at most one != filter.")
             if (notIn > 0 && (notEqual > 0 || disjunctive > 0 || hasOr)) {
                 throw NfsErrors.invalid("not-in cannot be combined with !=, in, array-contains-any or OR filters.")
             }
@@ -634,8 +636,12 @@ internal object NfsQueryBuilder {
         }
 
         val orderFields = orderBy.map { it["field"] as? String ?: "" }
-        (wire["startAt"] as? Map<String, Any?>)?.let { query = applyCursor(query, it, true, orderFields, db, collectionPath) }
-        (wire["endAt"] as? Map<String, Any?>)?.let { query = applyCursor(query, it, false, orderFields, db, collectionPath) }
+        val implicitFields = stats.inequalityFields.distinct()
+            .filter { it != "__name__" && it !in orderFields }
+            .sortedWith { a, b -> compareFieldPaths(a, b) }
+        val normalizedFields = orderFields + implicitFields
+        (wire["startAt"] as? Map<String, Any?>)?.let { query = applyCursor(query, it, true, orderFields, normalizedFields, db, collectionPath) }
+        (wire["endAt"] as? Map<String, Any?>)?.let { query = applyCursor(query, it, false, orderFields, normalizedFields, db, collectionPath) }
 
         return query
     }
@@ -667,6 +673,15 @@ internal object NfsQueryBuilder {
             if (values.size > MAX_DISJUNCTION_VALUES) throw NfsErrors.invalid("The $op operator supports at most $MAX_DISJUNCTION_VALUES values.")
             return values.map { operand(it) }
         }
+
+        // Mirrors the iOS checks, where the SDK raises uncatchable exceptions.
+        if (field == "__name__" && (op == "array-contains" || op == "array-contains-any")) {
+            throw NfsErrors.invalid("The $op operator cannot be used on the document id.")
+        }
+        if (op == "array-contains-any" && (raw as? List<*>)?.any { it is List<*> } == true) {
+            throw NfsErrors.invalid("array-contains-any values cannot be arrays (Firestore does not support nested arrays).")
+        }
+        if (op in listOf("!=", "<", "<=", ">", ">=", "not-in")) stats.inequalityFields.add(field)
 
         val isListOperator = op in listOf("in", "not-in", "array-contains-any")
         val value = if (isListOperator) null else operand(raw)
@@ -718,13 +733,44 @@ internal object NfsQueryBuilder {
         return id
     }
 
-    private fun applyCursor(query: Query, cursor: Map<String, Any?>, isStart: Boolean, orderFields: List<String>, db: FirebaseFirestore, collectionPath: String?): Query {
+    private fun compareFieldPaths(a: String, b: String): Int {
+        val left = a.split('.')
+        val right = b.split('.')
+        for (index in 0 until minOf(left.size, right.size)) {
+            val result = left[index].compareTo(right[index])
+            if (result != 0) return result
+        }
+        return left.size.compareTo(right.size)
+    }
+
+    /**
+     * The SDK builds a document cursor from the document's value for every
+     * normalized order field; report a missing field or an uncommitted
+     * server timestamp as invalid-argument with a clear message.
+     */
+    private fun validateCursorDocument(snapshot: DocumentSnapshot, fields: List<String>) {
+        for (field in fields) {
+            if (field == "__name__") continue
+            val path = NfsPaths.fieldPath(field)
+            if (!snapshot.contains(path)) {
+                throw NfsErrors.invalid("The cursor document [${snapshot.reference.path}] has no [$field] field, which the query is ordered by.")
+            }
+            if (snapshot.get(path, DocumentSnapshot.ServerTimestampBehavior.NONE) == null &&
+                snapshot.get(path, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) is Timestamp
+            ) {
+                throw NfsErrors.invalid("The cursor document [${snapshot.reference.path}] has a pending server timestamp in [$field], which the query is ordered by; wait for the write to commit.")
+            }
+        }
+    }
+
+    private fun applyCursor(query: Query, cursor: Map<String, Any?>, isStart: Boolean, orderFields: List<String>, normalizedFields: List<String>, db: FirebaseFirestore, collectionPath: String?): Query {
         val inclusive = cursor["inclusive"] as? Boolean ?: true
 
         val documentPath = cursor["document"] as? String
         if (documentPath != null) {
             val snapshot = NfsRuntime.await(NfsPaths.document(documentPath, db).get(), "Reading the cursor document")
             if (!snapshot.exists()) throw NfsErrors.invalid("Cursor document [$documentPath] does not exist.")
+            validateCursorDocument(snapshot, normalizedFields)
             return when {
                 isStart && inclusive -> query.startAt(snapshot)
                 isStart -> query.startAfter(snapshot)

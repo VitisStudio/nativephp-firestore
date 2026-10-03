@@ -692,11 +692,15 @@ enum NFSQueryBuilder {
         }
 
         let orderFields = orderBy.compactMap { $0["field"] as? String }
+        let implicitFields = Array(Set(stats.inequalityFields))
+            .filter { $0 != "__name__" && !orderFields.contains($0) }
+            .sorted { $0.split(separator: ".", omittingEmptySubsequences: false).lexicographicallyPrecedes($1.split(separator: ".", omittingEmptySubsequences: false)) }
+        let cursorFields = CursorFields(explicit: orderFields, normalized: orderFields + implicitFields)
         if let start = wire["startAt"] as? [String: Any] {
-            query = try applyCursor(query, start, edge: "start", orderFields: orderFields, db: db, collectionPath: isGroup ? nil : path)
+            query = try applyCursor(query, start, edge: "start", fields: cursorFields, db: db, collectionPath: isGroup ? nil : path)
         }
         if let end = wire["endAt"] as? [String: Any] {
-            query = try applyCursor(query, end, edge: "end", orderFields: orderFields, db: db, collectionPath: isGroup ? nil : path)
+            query = try applyCursor(query, end, edge: "end", fields: cursorFields, db: db, collectionPath: isGroup ? nil : path)
         }
 
         return query
@@ -708,6 +712,7 @@ enum NFSQueryBuilder {
         var notIn = 0
         var notEqual = 0
         var hasOr = false
+        var inequalityFields: [String] = []
 
         func validate() throws {
             if arrayContains > 1 {
@@ -715,6 +720,9 @@ enum NFSQueryBuilder {
             }
             if notIn > 1 {
                 throw NFSError.invalid("A query can use at most one not-in filter.")
+            }
+            if notEqual > 1 {
+                throw NFSError.invalid("A query can use at most one != filter.")
             }
             if notIn > 0 && (notEqual > 0 || disjunctive > 0 || hasOr) {
                 throw NFSError.invalid("not-in cannot be combined with !=, in, array-contains-any or OR filters.")
@@ -755,6 +763,17 @@ enum NFSQueryBuilder {
                 throw NFSError.invalid("The \(op) operator supports at most \(maxDisjunctionValues) values.")
             }
             return try values.map { try operand($0) }
+        }
+
+        // The SDK raises uncatchable NSExceptions for these, so reject them here.
+        if isDocumentId && (op == "array-contains" || op == "array-contains-any") {
+            throw NFSError.invalid("The \(op) operator cannot be used on the document id.")
+        }
+        if op == "array-contains-any", let values = raw as? [Any], values.contains(where: { $0 is [Any] }) {
+            throw NFSError.invalid("array-contains-any values cannot be arrays (Firestore does not support nested arrays).")
+        }
+        if ["!=", "<", "<=", ">", ">=", "not-in"].contains(op) {
+            stats.inequalityFields.append(field)
         }
 
         let isListOperator = ["in", "not-in", "array-contains-any"].contains(op)
@@ -812,6 +831,22 @@ enum NFSQueryBuilder {
         return try NFSPaths.document(id, db)
     }
 
+    /// The SDK builds a document cursor from the document's value for every
+    /// normalized order field and raises an NSException (which Swift cannot
+    /// catch, so the app would crash) when one is missing or is a server
+    /// timestamp that has not been committed yet.
+    private static func validateCursorDocument(_ snapshot: DocumentSnapshot, fields: [String]) throws {
+        for field in fields where field != "__name__" {
+            let path = try NFSPaths.fieldPath(field)
+            guard let estimate = snapshot.get(path, serverTimestampBehavior: .estimate) else {
+                throw NFSError.invalid("The cursor document [\(snapshot.reference.path)] has no [\(field)] field, which the query is ordered by.")
+            }
+            if estimate is Timestamp, snapshot.get(path, serverTimestampBehavior: .none) is NSNull {
+                throw NFSError.invalid("The cursor document [\(snapshot.reference.path)] has a pending server timestamp in [\(field)], which the query is ordered by; wait for the write to commit.")
+            }
+        }
+    }
+
     /// Cursor values for a document-id ordering must be strings: a plain id
     /// for collection queries, a full document path for collection groups.
     private static func documentIdCursorValue(_ value: Any, collectionPath: String?) throws -> String {
@@ -831,14 +866,24 @@ enum NFSQueryBuilder {
         return id
     }
 
-    private static func applyCursor(_ query: FirebaseFirestore.Query, _ cursor: [String: Any], edge: String, orderFields: [String], db: Firestore, collectionPath: String?) throws -> FirebaseFirestore.Query {
+    /// Explicit orderBy fields (what value cursors line up with) and the
+    /// normalized ordering the SDK builds document cursors from: explicit
+    /// fields, then unordered inequality fields, then the document id.
+    private struct CursorFields {
+        let explicit: [String]
+        let normalized: [String]
+    }
+
+    private static func applyCursor(_ query: FirebaseFirestore.Query, _ cursor: [String: Any], edge: String, fields: CursorFields, db: Firestore, collectionPath: String?) throws -> FirebaseFirestore.Query {
         let inclusive = (cursor["inclusive"] as? Bool) ?? true
+        let orderFields = fields.explicit
 
         if let path = cursor["document"] as? String {
             let snapshot = try NFSOperations.fetch(try NFSPaths.document(path, db), source: .default)
             guard snapshot.exists else {
                 throw NFSError.invalid("Cursor document [\(path)] does not exist.")
             }
+            try validateCursorDocument(snapshot, fields: fields.normalized)
             if edge == "start" {
                 return inclusive ? query.start(atDocument: snapshot) : query.start(afterDocument: snapshot)
             }

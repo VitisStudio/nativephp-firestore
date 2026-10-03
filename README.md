@@ -188,7 +188,7 @@ Firestore::collection('tasks')->orderBy('priority')->startAt(2)->endBefore(5)->g
 Firestore::collection('tasks')->where(FieldPath::documentId(), 'in', ['t1', 't2']);
 ```
 
-Firestore's own rules apply: inequality filters need composite indexes once they're combined with other fields (the error message contains the link that creates the index), and `not-in` can't be combined with `!=`, `in`, `array-contains-any` or OR filters.
+Firestore's own rules apply: inequality filters need composite indexes once they're combined with other fields (the error message contains the link that creates the index), and `not-in` can't be combined with `!=`, `in`, `array-contains-any` or OR filters. A query allows one `!=`, one `not-in` and one `array-contains`/`array-contains-any`; a `not-in` list containing `null` matches nothing. A document cursor needs a value for every field the query is ordered by (explicit `orderBy()` fields plus any inequality-filter fields), and can't use a document whose ordered field holds a server timestamp that hasn't committed yet. These mistakes surface as an `InvalidArgumentException` (or a `FirestoreException` with code `invalid-argument` from the device) instead of reaching the SDK.
 
 ### Writes
 
@@ -368,7 +368,7 @@ it('completes a task', function () {
 
 The fake implements Firestore's semantics, not just storage:
 
-- queries: every operator, OR/AND filters, Firestore's cross-type ordering, implicit ordering by the inequality field, documents missing an `orderBy` field are excluded, cursors, `limitToLast`, collection groups, `count()`
+- queries: every operator, OR/AND filters, Firestore's cross-type ordering, implicit ordering by inequality fields, documents missing an `orderBy` field are excluded, cursors, `limitToLast`, collection groups, `count()`
 - all `FieldValue`s (`serverTimestamp()` uses Carbon's test clock)
 - `set` / merge / `mergeFields` / dotted `update`, and atomic batches that roll back on failure
 - transactions with real conflict detection: if a document you read changes before commit, the callback re-runs, and after `maxAttempts` you get `aborted`

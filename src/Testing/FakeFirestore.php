@@ -11,6 +11,7 @@ use VitisStudio\NativeFirestore\Events\DocumentChanged;
 use VitisStudio\NativeFirestore\Events\QuerySnapshotChanged;
 use VitisStudio\NativeFirestore\Exceptions\FirestoreException;
 use VitisStudio\NativeFirestore\Support\Path;
+use VitisStudio\NativeFirestore\Support\QueryRules;
 use VitisStudio\NativeFirestore\Support\ValueCodec;
 
 /**
@@ -593,7 +594,7 @@ class FakeFirestore implements FirestoreDriver
      */
     private function evaluateQuery(array $query): array
     {
-        $orderBy = $this->effectiveOrderBy($query);
+        $orderBy = QueryRules::normalizedOrderBy($query);
         $context = $query;
 
         $paths = array_values(array_filter(
@@ -642,55 +643,6 @@ class FakeFirestore implements FirestoreDriver
         return ! empty($query['collectionGroup'])
             ? Path::lastSegment($parent) === $query['path']
             : $parent === $query['path'];
-    }
-
-    /**
-     * Explicit orderBy clauses, the implicit inequality-field ordering, then
-     * the document name as the final tie-breaker.
-     *
-     * @param  array<string, mixed>  $query
-     * @return list<array{field: string, direction: string}>
-     */
-    private function effectiveOrderBy(array $query): array
-    {
-        $orderBy = array_values($query['orderBy'] ?? []);
-
-        if ($orderBy === []) {
-            $field = $this->firstInequalityField($query['filters'] ?? []);
-
-            if ($field !== null) {
-                $orderBy[] = ['field' => $field, 'direction' => 'asc'];
-            }
-        }
-
-        $fields = array_column($orderBy, 'field');
-
-        if (! in_array('__name__', $fields, true)) {
-            $last = end($orderBy);
-            $orderBy[] = ['field' => '__name__', 'direction' => $last['direction'] ?? 'asc'];
-        }
-
-        return $orderBy;
-    }
-
-    /**
-     * @param  list<array<string, mixed>>  $filters
-     */
-    private function firstInequalityField(array $filters): ?string
-    {
-        foreach ($filters as $filter) {
-            if (isset($filter['composite'])) {
-                $field = $this->firstInequalityField($filter['filters']);
-            } else {
-                $field = in_array($filter['op'], ['!=', '<', '<=', '>', '>=', 'not-in'], true) ? $filter['field'] : null;
-            }
-
-            if ($field !== null) {
-                return $field;
-            }
-        }
-
-        return null;
     }
 
     /**
@@ -844,12 +796,21 @@ class FakeFirestore implements FirestoreDriver
                 throw new FirestoreException("Cursor document [{$path}] does not exist.", FirestoreException::INVALID_ARGUMENT);
             }
 
+            $missing = QueryRules::missingCursorFields($query, fn (string $field) => $this->field($path, $field)[0]);
+
+            if ($missing !== []) {
+                throw new FirestoreException(
+                    sprintf('The cursor document [%s] has no [%s] field, which the query is ordered by.', $path, implode(', ', $missing)),
+                    FirestoreException::INVALID_ARGUMENT,
+                );
+            }
+
             return array_map(fn (array $order) => $this->field($path, $order['field'])[1], $orderBy);
         }
 
         $values = array_values($cursor['values']);
 
-        if (count($values) > count($orderBy)) {
+        if (count($values) > count($query['orderBy'] ?? [])) {
             throw new FirestoreException('Too many cursor values for the query ordering.', FirestoreException::INVALID_ARGUMENT);
         }
 

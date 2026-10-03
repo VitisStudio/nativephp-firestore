@@ -212,6 +212,21 @@ describe('queries', function () {
         expect($ids($page2))->toBe(['t4', 't1']);
     });
 
+    it('rejects a cursor document that lacks a field the query is ordered by', function () {
+        $snapshot = Firestore::doc('tasks/t1')->get();
+        Firestore::doc('tasks/t1')->update(['priority' => FieldValue::delete()]);
+
+        expect(fn () => Firestore::collection('tasks')->orderBy('priority')->startAfter($snapshot)->get())
+            ->toThrow(fn (FirestoreException $e) => expect($e->is(FirestoreException::INVALID_ARGUMENT))->toBeTrue());
+    });
+
+    it('orders implicitly by every inequality field and paginates over them with a document', function () use ($ids) {
+        $query = Firestore::collection('tasks')->where('priority', '>=', 1)->where('owner', '!=', 'nobody');
+
+        expect($ids($query->get()))->toBe(['t3', 't1', 't2'])
+            ->and($ids($query->startAfter(Firestore::doc('tasks/t3')->get())->get()))->toBe(['t1', 't2']);
+    });
+
     it('excludes documents missing the orderBy field', function () use ($ids) {
         expect($ids(Firestore::collection('tasks')->orderBy('owner')->get()))->toBe(['t4', 't1', 't3', 't2']);
     });
