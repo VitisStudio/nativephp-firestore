@@ -486,7 +486,8 @@ class FakeFirestore implements FirestoreDriver
                             throw new FirestoreException("Merge field [{$fieldPath}] is not in the data.", FirestoreException::INVALID_ARGUMENT);
                         }
 
-                        $result = $this->applyField($result, $segments, $value);
+                        // Merge data may delete nested fields (the SDK parses it in merge context).
+                        $result = $this->applyField($result, $segments, $value, allowNestedDelete: true);
                     }
 
                     $documents[$path] = $result;
@@ -512,7 +513,7 @@ class FakeFirestore implements FirestoreDriver
      *
      * @param  list<string>  $segments
      */
-    private function applyField(stdClass $map, array $segments, mixed $value): stdClass
+    private function applyField(stdClass $map, array $segments, mixed $value, bool $allowNestedDelete = false): stdClass
     {
         $map = clone $map;
         $key = array_shift($segments);
@@ -524,13 +525,16 @@ class FakeFirestore implements FirestoreDriver
                 return $map;
             }
 
-            $map->{$key} = $this->resolveValue($map->{$key} ?? null, $value);
+            $current = $map->{$key} ?? null;
+            $map->{$key} = $allowNestedDelete && $value instanceof stdClass && get_object_vars($value) !== []
+                ? $this->resolveMap($current instanceof stdClass ? $current : new stdClass, $value, allowDelete: true)
+                : $this->resolveValue($current, $value);
 
             return $map;
         }
 
         $child = $map->{$key} ?? null;
-        $map->{$key} = $this->applyField($child instanceof stdClass ? $child : new stdClass, $segments, $value);
+        $map->{$key} = $this->applyField($child instanceof stdClass ? $child : new stdClass, $segments, $value, $allowNestedDelete);
 
         return $map;
     }

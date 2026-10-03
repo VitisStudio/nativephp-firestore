@@ -1026,3 +1026,23 @@ describe('SDK fidelity', function () {
         Event::assertDispatched(WriteFailed::class, fn (WriteFailed $event) => $event->code === 'not-found' && $event->paths === ['a/2', 'a/missing']);
     });
 });
+
+it('allows nested deletes inside a mergeFields selection, like the SDK', function () {
+    \VitisStudio\NativeFirestore\Facades\Firestore::fake();
+    $doc = \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->doc('a');
+    $doc->set(['title' => 'x', 'prefs' => ['keep' => 1, 'remove' => true, 'other' => 'y']]);
+
+    $doc->set(['prefs' => ['keep' => 3, 'remove' => \VitisStudio\NativeFirestore\FieldValue::delete()]], merge: ['prefs']);
+
+    // The mask covers all of prefs, so it is replaced by the written map minus the deleted field.
+    expect($doc->get()->data())->toBe(['title' => 'x', 'prefs' => ['keep' => 3]]);
+});
+
+it('still refuses nested deletes inside update() map values', function () {
+    \VitisStudio\NativeFirestore\Facades\Firestore::fake();
+    $doc = \VitisStudio\NativeFirestore\Facades\Firestore::collection('t')->doc('a');
+    $doc->set(['prefs' => ['remove' => true]]);
+
+    expect(fn () => $doc->update(['prefs' => ['remove' => \VitisStudio\NativeFirestore\FieldValue::delete()]]))
+        ->toThrow(\InvalidArgumentException::class, 'top level of update() data');
+});
