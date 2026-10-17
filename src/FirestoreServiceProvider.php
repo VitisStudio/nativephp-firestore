@@ -6,6 +6,7 @@ use Illuminate\Support\ServiceProvider;
 use VitisStudio\NativeFirestore\Bridge\NativeAuthDriver;
 use VitisStudio\NativeFirestore\Bridge\NativeBridge;
 use VitisStudio\NativeFirestore\Bridge\NativeFirestoreDriver;
+use VitisStudio\NativeFirestore\Bridge\NativeMessagingDriver;
 use VitisStudio\NativeFirestore\Commands\CopyFirebaseConfigCommand;
 
 class FirestoreServiceProvider extends ServiceProvider
@@ -26,8 +27,13 @@ class FirestoreServiceProvider extends ServiceProvider
             new NativeAuthDriver($app->make(NativeBridge::class)),
         ));
 
+        $this->app->singleton('firebase.messaging', fn ($app) => new FirebaseMessagingClient(
+            new NativeMessagingDriver($app->make(NativeBridge::class)),
+        ));
+
         $this->app->alias('firestore', FirestoreClient::class);
         $this->app->alias('firebase.auth', FirebaseAuthClient::class);
+        $this->app->alias('firebase.messaging', FirebaseMessagingClient::class);
     }
 
     public function boot(): void

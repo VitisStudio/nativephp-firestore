@@ -4,7 +4,7 @@
 
 # NativePHP Firestore
 
-Cloud Firestore and Firebase Authentication for [NativePHP Mobile](https://nativephp.com) v4, backed by the **native Firebase SDKs** (FirebaseFirestore + FirebaseAuth on iOS via Swift Package Manager, `firebase-firestore` + `firebase-auth` on Android via the Firebase BoM).
+Cloud Firestore, Firebase Authentication and Cloud Messaging (push) for [NativePHP Mobile](https://nativephp.com) v4, backed by the **native Firebase SDKs** (FirebaseFirestore + FirebaseAuth + FirebaseMessaging on iOS via Swift Package Manager, `firebase-firestore` + `firebase-auth` + `firebase-messaging` on Android via the Firebase BoM).
 
 You get the real SDKs' behaviour on-device: offline persistence, realtime listeners, latency-compensated writes, transactions and security rules that see the signed-in user. The API is PHP:
 
@@ -341,6 +341,32 @@ FirebaseAuth::stopListening();
 
 Auth and Firestore share the same native FirebaseApp, so security rules see `request.auth` for the signed-in user. Sessions persist across launches; that's the SDK's behaviour.
 
+## Push notifications (Cloud Messaging)
+
+```php
+use VitisStudio\NativeFirestore\Facades\FirebaseMessaging;
+
+FirebaseMessaging::requestPermission();   // 'granted' | 'denied' | 'provisional' | … (iOS prompts only once)
+FirebaseMessaging::allowed();             // bool, without prompting
+$token = FirebaseMessaging::getToken();   // FCM registration token: store it server-side to send to this install
+FirebaseMessaging::deleteToken();         // on sign-out
+FirebaseMessaging::takeOpenedNotification(); // ?DTO\PushNotification whose tap opened the app (once)
+FirebaseMessaging::setBadgeCount(0);
+```
+
+Events: `NotificationReceived` (a push arrived while the app was in the foreground; the banner still shows), `NotificationOpened` (a tap), `MessagingTokenRefreshed` (replace the stored token). A tap that cold-starts the app happens before PHP is listening, so call `takeOpenedNotification()` on launch too.
+
+Setup:
+
+- Turn on push in the app: `'permissions' => ['push_notifications' => true]` in `config/nativephp.php` (NativePHP adds the `aps-environment` entitlement and the `remote-notification` background mode).
+- Upload an APNs authentication key in the Firebase console (Project settings, Cloud Messaging). Without it the token is issued but nothing is delivered.
+- Sending happens on your server or in Cloud Functions with the Admin SDK (`messaging().sendEachForMulticast({tokens, notification, data, apns})`). Put routing hints in `data`; FCM delivers its values as strings.
+- The iOS simulator can register for push (Apple silicon, Xcode 14+), but delivery needs a real APNs key. With the Emulator Suite there is no FCM, so `getToken()` fails; treat that as "no push on this device".
+
+Android: the permission prompt (Android 13+) answers after `requestPermission()` has returned, so check `allowed()` again when the app resumes. A tap that opens the app cold is available from `takeOpenedNotification()`; a tap while the app is already running reaches NativePHP core as a new intent without data, which the plugin can't see. Core navigates to a `notification_url` key in the message's `data` itself, so send the screen there too.
+
+The plugin owns `UNUserNotificationCenter`'s delegate on iOS. If your app or another plugin sets its own delegate, the last one to do so wins.
+
 ## Errors
 
 Every failure throws a subclass of `Exceptions\FirebaseException`, with the Firebase code available from `errorCode()`:
@@ -361,7 +387,7 @@ The plugin never crashes the app when Firebase isn't configured. Every call retu
 
 ## Testing with fakes
 
-`Firestore::fake()` and `FirebaseAuth::fake()` swap in in-memory implementations of the same API, so unit tests run without Firebase, a device or the bridge:
+`Firestore::fake()`, `FirebaseAuth::fake()` and `FirebaseMessaging::fake()` swap in in-memory implementations of the same API, so unit tests run without Firebase, a device or the bridge:
 
 ```php
 use VitisStudio\NativeFirestore\Facades\Firestore;
@@ -385,7 +411,7 @@ The fake implements Firestore's semantics, not just storage:
 - transactions with real conflict detection: if a document you read changes before commit, the callback re-runs, and after `maxAttempts` you get `aborted`
 - listeners: an initial snapshot plus incremental `docChanges` dispatched through Laravel's event dispatcher, so `Event::fake()` / `Event::assertDispatched()` work
 
-Fake helpers: `seed()`, `seedCollection()`, `document()`, `documents()`, `failNext('permission-denied')`, `rejectNextCommit()`, `beforeServerCommit()`, `commits()`, `emittedEvents()`, `activeListeners()`, `assertExists()`, `assertMissing()`, `assertCount()`, `assertListening()`, `assertNotListening()`. `Firestore::disableNetwork()` makes server reads, `count()` and transactions fail with `unavailable`.
+Fake helpers: `seed()`, `seedCollection()`, `document()`, `documents()`, `failNext('permission-denied')`, `rejectNextCommit()`, `beforeServerCommit()`, `commits()`, `reads()` (every get and query with its source and document count; `forgetReads()` clears it), `emittedEvents()`, `activeListeners()`, `assertExists()`, `assertMissing()`, `assertCount()`, `assertListening()`, `assertNotListening()`. `Firestore::disableNetwork()` makes server reads, `count()` and transactions fail with `unavailable`.
 
 Writes in the fake behave like they do with wait-for-server off or on:
 
@@ -406,6 +432,8 @@ foreach ($firestore->emittedEvents() as [$event, $payload]) {
 
 $screen->assertSee('Buy milk');
 ```
+
+`FirebaseMessaging::fake()` supports `answerPromptWith()`, `setPermission()`, `withoutToken()`, `refreshToken()`, `tap()`, `receiveInForeground()`, `currentToken()`, `assertPrompted()` and `badge()`.
 
 `FirebaseAuth::fake()` supports `addUser()`, `actingAs()`, `assertSignedIn()`, `assertSignedOut()`, `assertPasswordResetSent()`, and uses the SDK error codes (with email-enumeration protection, an unknown email and a wrong password both give `invalid-credential`).
 

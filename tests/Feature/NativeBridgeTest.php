@@ -9,6 +9,7 @@ use VitisStudio\NativeFirestore\Exceptions\FirebaseAuthException;
 use VitisStudio\NativeFirestore\Exceptions\FirebaseException;
 use VitisStudio\NativeFirestore\Exceptions\FirestoreException;
 use VitisStudio\NativeFirestore\Facades\FirebaseAuth;
+use VitisStudio\NativeFirestore\Facades\FirebaseMessaging;
 use VitisStudio\NativeFirestore\Facades\Firestore;
 use VitisStudio\NativeFirestore\FieldValue;
 use VitisStudio\NativeFirestore\Query\Transaction;
@@ -293,4 +294,31 @@ it('decodes whole-valued doubles in event payloads', function () {
         ->and($snapshot->first()->get('n'))->toBe(2)
         ->and($snapshot->docChanges()[0]->document->get('m')->toArray())->toBe([2.0])
         ->and($document->get('x'))->toBe(1.0);
+});
+
+it('drives FirebaseMessaging over the bridge, configuring Firebase first', function () {
+    $this->bridge
+        ->respondTo('FirebaseMessaging.RequestPermission', nativeResult(['status' => 'granted']))
+        ->respondTo('FirebaseMessaging.GetToken', nativeResult(['token' => 'fcm-123']))
+        ->respondTo('FirebaseMessaging.TakeOpenedNotification', nativeResult(['notification' => ['title' => 'Hi', 'body' => null, 'data' => ['screen' => 'today']]]))
+        ->respondTo('FirebaseMessaging.SetBadgeCount', nativeResult(['count' => 0]));
+
+    expect(FirebaseMessaging::requestPermission())->toBe('granted')
+        ->and(FirebaseMessaging::getToken())->toBe('fcm-123');
+
+    $opened = FirebaseMessaging::takeOpenedNotification();
+    expect($opened->title)->toBe('Hi')
+        ->and($opened->body)->toBeNull()
+        ->and($opened->get('screen'))->toBe('today');
+
+    FirebaseMessaging::setBadgeCount(-3);
+
+    expect(payloadOf($this->bridge->callsTo('FirebaseMessaging.SetBadgeCount')[0]))->toBe(['count' => 0]);
+    $this->bridge->assertCalledTimes('Firestore.Configure', 1);
+});
+
+it('returns no opened notification when nothing was tapped', function () {
+    $this->bridge->respondTo('FirebaseMessaging.TakeOpenedNotification', nativeResult(['notification' => null]));
+
+    expect(FirebaseMessaging::takeOpenedNotification())->toBeNull();
 });
