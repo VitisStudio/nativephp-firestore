@@ -1,3 +1,7 @@
+<p align="center">
+    <img src="https://raw.githubusercontent.com/VitisStudio/nativephp-firestore/main/art/hero.png" alt="NativePHP Firestore by Vitis Studio" width="100%">
+</p>
+
 # NativePHP Firestore
 
 Cloud Firestore and Firebase Authentication for [NativePHP Mobile](https://nativephp.com) v4, backed by the **native Firebase SDKs** (FirebaseFirestore + FirebaseAuth on iOS via Swift Package Manager, `firebase-firestore` + `firebase-auth` on Android via the Firebase BoM).
