@@ -1046,3 +1046,21 @@ it('still refuses nested deletes inside update() map values', function () {
     expect(fn () => $doc->update(['prefs' => ['remove' => \VitisStudio\NativeFirestore\FieldValue::delete()]]))
         ->toThrow(\InvalidArgumentException::class, 'top level of update() data');
 });
+
+describe('read log', function () {
+    it('records each get and query with its source and document count', function () {
+        $this->fake->seed('notes/n1', ['title' => 'One'])->seed('notes/n2', ['title' => 'Two']);
+
+        Firestore::doc('notes/n1')->get(Source::Cache);
+        Firestore::collection('notes')->get(Source::Server);
+        Firestore::collection('notes')->where('title', '==', 'Nope')->get();
+
+        expect($this->fake->reads())->toBe([
+            ['kind' => 'document', 'path' => 'notes/n1', 'source' => 'cache', 'documents' => 1],
+            ['kind' => 'query', 'path' => 'notes', 'source' => 'server', 'documents' => 2],
+            ['kind' => 'query', 'path' => 'notes', 'source' => 'default', 'documents' => 0],
+        ]);
+
+        expect($this->fake->forgetReads()->reads())->toBe([]);
+    });
+});
