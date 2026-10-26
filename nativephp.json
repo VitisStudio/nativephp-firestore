@@ -1,7 +1,7 @@
 {
     "name": "vitisstudio/nativephp-firestore",
     "version": "0.1.0",
-    "description": "Cloud Firestore and Firebase Authentication backed by the native Firebase SDKs.",
+    "description": "Cloud Firestore, Firebase Authentication and Cloud Messaging backed by the native Firebase SDKs.",
     "namespace": "Firestore",
     "keywords": [
         "firebase",
@@ -9,7 +9,9 @@
         "auth",
         "database",
         "offline",
-        "realtime"
+        "realtime",
+        "push",
+        "notifications"
     ],
     "category": "data",
     "license": "MIT",
@@ -173,23 +175,72 @@
             "ios": "FirebaseAuthFunctions.StopListening",
             "android": "com.vitisstudio.plugins.firestore.FirebaseAuthFunctions.StopListening",
             "description": "Stop dispatching AuthStateChanged events"
+        },
+        {
+            "name": "FirebaseMessaging.RequestPermission",
+            "ios": "FirebaseMessagingFunctions.RequestPermission",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseMessagingFunctions.RequestPermission",
+            "description": "Ask to show notifications and register for remote notifications"
+        },
+        {
+            "name": "FirebaseMessaging.PermissionStatus",
+            "ios": "FirebaseMessagingFunctions.PermissionStatus",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseMessagingFunctions.PermissionStatus",
+            "description": "Report the notification permission without prompting"
+        },
+        {
+            "name": "FirebaseMessaging.GetToken",
+            "ios": "FirebaseMessagingFunctions.GetToken",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseMessagingFunctions.GetToken",
+            "description": "Return this install's FCM registration token"
+        },
+        {
+            "name": "FirebaseMessaging.DeleteToken",
+            "ios": "FirebaseMessagingFunctions.DeleteToken",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseMessagingFunctions.DeleteToken",
+            "description": "Delete this install's FCM registration token"
+        },
+        {
+            "name": "FirebaseMessaging.TakeOpenedNotification",
+            "ios": "FirebaseMessagingFunctions.TakeOpenedNotification",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseMessagingFunctions.TakeOpenedNotification",
+            "description": "Return (once) the notification whose tap opened the app"
+        },
+        {
+            "name": "FirebaseMessaging.SetBadgeCount",
+            "ios": "FirebaseMessagingFunctions.SetBadgeCount",
+            "android": "com.vitisstudio.plugins.firestore.FirebaseMessagingFunctions.SetBadgeCount",
+            "description": "Set the app icon badge count"
         }
     ],
     "android": {
         "min_version": 26,
         "permissions": [
             "android.permission.INTERNET",
-            "android.permission.ACCESS_NETWORK_STATE"
+            "android.permission.ACCESS_NETWORK_STATE",
+            "android.permission.POST_NOTIFICATIONS"
         ],
         "dependencies": {
             "implementation": [
                 "platform(com.google.firebase:firebase-bom:34.0.0)",
                 "com.google.firebase:firebase-firestore",
-                "com.google.firebase:firebase-auth"
+                "com.google.firebase:firebase-auth",
+                "com.google.firebase:firebase-messaging"
             ]
         },
         "proguard_rules": [
             "-keep class com.vitisstudio.plugins.firestore.** { *; }"
+        ],
+        "services": [
+            {
+                "name": ".NfsMessagingService",
+                "exported": false,
+                "intent_filters": [
+                    {
+                        "action": "com.google.firebase.MESSAGING_EVENT"
+                    }
+                ]
+            }
         ]
     },
     "ios": {
@@ -201,19 +252,24 @@
                     "version": "12.0.0",
                     "products": [
                         "FirebaseFirestore",
-                        "FirebaseAuth"
+                        "FirebaseAuth",
+                        "FirebaseMessaging"
                     ]
                 }
             ],
             "pods": []
-        }
+        },
+        "init_function": "NFSMessaging.install"
     },
     "events": [
         "VitisStudio\\NativeFirestore\\Events\\DocumentChanged",
         "VitisStudio\\NativeFirestore\\Events\\QuerySnapshotChanged",
         "VitisStudio\\NativeFirestore\\Events\\ListenerFailed",
         "VitisStudio\\NativeFirestore\\Events\\WriteFailed",
-        "VitisStudio\\NativeFirestore\\Events\\AuthStateChanged"
+        "VitisStudio\\NativeFirestore\\Events\\AuthStateChanged",
+        "VitisStudio\\NativeFirestore\\Events\\NotificationReceived",
+        "VitisStudio\\NativeFirestore\\Events\\NotificationOpened",
+        "VitisStudio\\NativeFirestore\\Events\\MessagingTokenRefreshed"
     ],
     "service_provider": "VitisStudio\\NativeFirestore\\FirestoreServiceProvider",
     "hooks": {

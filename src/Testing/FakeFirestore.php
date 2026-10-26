@@ -51,6 +51,9 @@ class FakeFirestore implements FirestoreDriver
     /** @var list<list<array<string, mixed>>> */
     private array $commits = [];
 
+    /** @var list<array{kind: 'document'|'query', path: string, source: string, documents: int}> */
+    private array $reads = [];
+
     private bool $networkEnabled = true;
 
     /** @var list<array{code: string, message: string}> */
@@ -183,6 +186,24 @@ class FakeFirestore implements FirestoreDriver
     }
 
     /**
+     * Every document get and query run, with the source asked for and how many
+     * documents came back, so tests can tell cache reads from billed ones.
+     *
+     * @return list<array{kind: 'document'|'query', path: string, source: string, documents: int}>
+     */
+    public function reads(): array
+    {
+        return $this->reads;
+    }
+
+    public function forgetReads(): static
+    {
+        $this->reads = [];
+
+        return $this;
+    }
+
+    /**
      * @return list<string>
      */
     public function activeListeners(): array
@@ -256,7 +277,10 @@ class FakeFirestore implements FirestoreDriver
         $this->throwPendingFailure();
         $this->guardSource($source);
 
-        return $this->export($this->documentSnapshot(Path::document($path)));
+        $snapshot = $this->export($this->documentSnapshot(Path::document($path)));
+        $this->reads[] = ['kind' => 'document', 'path' => Path::document($path), 'source' => $source, 'documents' => 1];
+
+        return $snapshot;
     }
 
     /**
@@ -333,7 +357,10 @@ class FakeFirestore implements FirestoreDriver
         $this->throwPendingFailure();
         $this->guardSource($source);
 
-        return $this->export($this->querySnapshot($this->typedQuery($query)));
+        $snapshot = $this->export($this->querySnapshot($this->typedQuery($query)));
+        $this->reads[] = ['kind' => 'query', 'path' => (string) ($query['path'] ?? ''), 'source' => $source, 'documents' => count($snapshot['documents'] ?? [])];
+
+        return $snapshot;
     }
 
     public function count(array $query): int

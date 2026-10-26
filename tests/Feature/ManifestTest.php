@@ -32,7 +32,8 @@ it('declares a valid plugin manifest', function () {
     expect($manifest['namespace'])->toBe('Firestore')
         ->and($composer['type'])->toBe('nativephp-plugin')
         ->and($composer['extra']['nativephp']['manifest'])->toBe('nativephp.json')
-        ->and($manifest['ios']['dependencies']['swift_packages'][0]['products'])->toBe(['FirebaseFirestore', 'FirebaseAuth'])
+        ->and($manifest['ios']['dependencies']['swift_packages'][0]['products'])->toBe(['FirebaseFirestore', 'FirebaseAuth', 'FirebaseMessaging'])
+        ->and($manifest['ios']['init_function'])->toBe('NFSMessaging.install')
         ->and($manifest['android']['dependencies']['implementation'][0])->toStartWith('platform(com.google.firebase:firebase-bom:');
 });
 
@@ -62,7 +63,7 @@ it('calls only bridge functions the manifest declares', function () {
         $php .= file_get_contents($file);
     }
 
-    preg_match_all("/'((?:Firestore|FirebaseAuth)\\.[A-Za-z]+)'/", $php, $matches);
+    preg_match_all("/'((?:Firestore|FirebaseAuth|FirebaseMessaging)\\.[A-Za-z]+)'/", $php, $matches);
 
     expect(array_diff(array_unique($matches[1]), $declared))->toBe([]);
 });
@@ -82,6 +83,9 @@ it('declares real event classes that the native payload keys can construct', fun
     [VitisStudio\NativeFirestore\Events\ListenerFailed::class, ['listenerId', 'code', 'message']],
     [VitisStudio\NativeFirestore\Events\WriteFailed::class, ['paths', 'code', 'message']],
     [VitisStudio\NativeFirestore\Events\AuthStateChanged::class, ['user']],
+    [VitisStudio\NativeFirestore\Events\NotificationReceived::class, ['title', 'body', 'data']],
+    [VitisStudio\NativeFirestore\Events\NotificationOpened::class, ['title', 'body', 'data']],
+    [VitisStudio\NativeFirestore\Events\MessagingTokenRefreshed::class, ['token']],
 ]);
 
 it('stays generic: no app-specific names or Firebase project config in the package', function () {
